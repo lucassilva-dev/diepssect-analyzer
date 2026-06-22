@@ -1,10 +1,24 @@
 # Diep.io Field Mapping Table
 
-This is the definitive reference for all known field indices in diep.io clientbound packets (packets 0x00 and 0x02).
+> ⚠️ **HONESTY NOTE (read first).** Only a handful of rows below are actually
+> grounded in evidence. The **verified** facts live in
+> [`RE-FINDINGS.md`](RE-FINDINGS.md). Specifically:
+> - Field **indices 1, 2, 3** exist and are read as `vi` (delta-encoded) —
+>   confirmed by the `CLIENTBOUND.md` example + the working decoder. Their
+>   human **labels** (angle/x/y) are *disputed* (the source docs contradict
+>   each other — see RE-FINDINGS).
+> - Fields **5** and **24** as `f32` health come from `CLIENTBOUND.md` only;
+>   not yet re-verified against a capture or the WASM.
+> - **Every other row in this table was inferred/placeholder and is NOT
+>   evidence.** Do not treat the "Confidence" column as measured. Rows are kept
+>   as a hypothesis backlog to be confirmed or deleted as real data arrives.
+>
+> A field's type is not in the packet, so the *only* way to extend this table
+> reliably is a live capture cross-checked against game state, or recovering
+> the index→type table from the WASM. See `docs/RE-FINDINGS.md` → "What is still open".
 
 **Last Updated:** 2026-06-22  
-**Protocol Version:** Latest (as of git commit 3256bf0)  
-**Confidence Levels:** ✓ Confirmed | ◐ Probable | ? Unknown
+**Confidence Levels:** ✓ Confirmed | ◐ Probable | ? Unknown / placeholder
 
 ## Overview
 

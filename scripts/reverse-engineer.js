@@ -19,13 +19,14 @@ const readline = require('readline')
 const fs = require('fs')
 
 // Try to load PacketAnalyzer and other tools
-let PacketAnalyzer, FieldMapper, LZ4Decompressor, PayloadClassifier
+let PacketAnalyzer, FieldMapper, LZ4Decompressor, PayloadClassifier, clientboundDecoder
 
 try {
   PacketAnalyzer = require('./packet-analyzer.js')
   FieldMapper = require('./field-mapper.js')
   LZ4Decompressor = require('./lz4-decompressor.js')
   PayloadClassifier = require('./payload-classifier.js')
+  clientboundDecoder = require('./clientbound-decoder.js')
 } catch (e) {
   console.error('Warning: Could not load analysis modules:', e.message)
 }
@@ -44,8 +45,7 @@ class ReverseEngineer {
 
     this.commands = {
       help: this.showHelp.bind(this),
-      test: this.testField.bind(this),
-      auto: this.autoDiscoverFields.bind(this),
+      decode: this.decodeUpdate.bind(this),
       analyze: this.analyzePacket.bind(this),
       validate: this.validateMapping.bind(this),
       export: this.exportFindings.bind(this),
@@ -64,12 +64,12 @@ class ReverseEngineer {
 ╚════════════════════════════════════════════════════════════════╝
 
 COMMANDS:
-  test <field>              Test specific field index
-  auto [count]              Auto-discover fields (test up to count fields)
+  decode [hex-data]         Decode a clientbound 0x00 update packet (REAL).
+                            With no args, decodes the CLIENTBOUND.md example.
   analyze <file>            Analyze packet capture from JSON file
   validate <file>           Validate field mapping against samples
   classify <hex-data>       Classify payload structure
-  decompress <hex-data>     Decompress LZ4 data
+  decompress <hex-data>     Decompress LZ4 data (packet 0x02)
   benchmark                 Run performance benchmarks
   export [format]           Export current findings (json/markdown)
   clear                     Clear all captures
@@ -77,97 +77,52 @@ COMMANDS:
   quit                      Exit
 
 EXAMPLES:
-  > test 24
-  > auto 50
+  > decode
+  > decode 00 20 02 01 04 01 06 01 01 07 00 01 00 a2 02 00 fc 01 00 73 01
   > analyze packets.json
   > classify 00 01 02 03
   > decompress [LZ4 hex dump]
 
-WORKFLOW:
-  1. Capture packets from diep.io
-  2. Use 'analyze' to load captures
-  3. Use 'test' to manually test fields
-  4. Use 'auto' to run automated discovery
-  5. Use 'export' to save findings
+NOTE: real field discovery requires either live captures or the full
+field-type table from the WASM. Honest decoding stops at the first field
+whose type is unknown (it cannot guess the byte length). See docs/RE-FINDINGS.md.
 `)
   }
 
-  async testField(args) {
-    const fieldIndex = parseInt(args[0])
-
-    if (isNaN(fieldIndex)) {
-      console.log('Usage: test <field_index>')
+  async decodeUpdate(args) {
+    if (!clientboundDecoder) {
+      console.log('clientbound-decoder.js not loaded.')
       return
     }
 
-    console.log(`
-Testing field ${fieldIndex}...
-
-This would connect to a test diep.io server and:
-1. Send packets with different values for field ${fieldIndex}
-2. Measure entity property changes
-3. Correlate with game state
-4. Suggest field type and meaning
-
-SIMULATED TEST RESULTS:
-`)
-
-    // Simulate test results
-    const testResults = {
-      fieldIndex,
-      typeInferences: [
-        { type: 'vi', confidence: 0.8, reasoning: 'Varint continuation bytes detected' },
-        { type: 'f32', confidence: 0.3, reasoning: 'Could be float in game coordinate range' },
-      ],
-      valueRange: {
-        min: Math.floor(Math.random() * 100),
-        max: Math.floor(Math.random() * 1000),
-      },
-      correlations: [
-        { property: 'health', correlation: 0.5 },
-        { property: 'position', correlation: 0.2 },
-      ],
-    }
-
-    console.log(JSON.stringify(testResults, null, 2))
-
-    this.fieldMapper.registerField(
-      fieldIndex,
-      'unknown',
-      'Requires validation',
-      testResults.valueRange
-    )
-  }
-
-  async autoDiscoverFields(args) {
-    const count = parseInt(args[0]) || 50
-
-    console.log(`
-Starting automated field discovery...
-Will test fields 0 to ${count}
-
-Progress:`)
-
-    for (let i = 0; i < count; i++) {
-      // Simulate test
-      const discovered = Math.random() > 0.7
-      const type = ['vi', 'vu', 'f32', 'str'][Math.floor(Math.random() * 4)]
-
-      if (discovered) {
-        console.log(`  [${i}] ✓ Field ${i}: ${type}`)
-        this.fieldMapper.registerField(i, type, `Auto-discovered field ${i}`)
-      } else {
-        console.log(`  [${i}] ✗ Field ${i}: No pattern detected`)
+    let bytes
+    if (args.length === 0) {
+      bytes = clientboundDecoder.CLIENTBOUND_MD_EXAMPLE
+      console.log('No hex given — decoding the CLIENTBOUND.md worked example.\n')
+    } else {
+      try {
+        bytes = args.join(' ').trim().split(/\s+/).map(b => {
+          const n = parseInt(b, 16)
+          if (isNaN(n) || n < 0 || n > 255) throw new Error(`bad byte "${b}"`)
+          return n
+        })
+      } catch (e) {
+        console.log('Invalid hex input:', e.message)
+        return
       }
-
-      // Simulate slow testing
-      await new Promise(resolve => setTimeout(resolve, 50))
     }
 
-    const summary = this.fieldMapper.exportJSON()
-    console.log(`
-Discovery complete!
-Found ${summary.fieldMap.size} probable fields`)
+    const out = clientboundDecoder.decodeUpdate(bytes)
+    console.log(JSON.stringify(out, null, 2))
+
+    if (out.consumedAll) {
+      console.log('\n✅ Clean parse — all bytes consumed.')
+    } else {
+      console.log(`\n⚠️  Stopped with ${out.bytesLeft} byte(s) left.`)
+      if (out.notes.length) console.log('   ' + out.notes.join('\n   '))
+      console.log('   (A field with an unknown type halts parsing — its byte ' +
+        'length cannot be guessed. Recover the type table from the WASM.)')
+    }
   }
 
   async analyzePacket(args) {

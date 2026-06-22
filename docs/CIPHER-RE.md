@@ -60,19 +60,45 @@ that reads that buffer and transforms it byte-by-byte; cross-check the transform
 against the known keystream above. Pin down #1245's table build + the seed→table
 shuffle. Realistically multi-session work on a stripped 4.7 MB module.
 
-### Path B — dynamic dump (tractable, RECOMMENDED)
+### Path B — dynamic dump (tractable, but needs a pre-load hook)
 The decrypted packets and the cipher tables both live in WASM linear memory at
 runtime. Instead of reconstructing the algorithm:
 - **B1 (decode game state):** read already-decoded entities straight from WASM
-  memory — exactly what this repo's `dpma/` tooling does via pointers. No cipher
-  needed to get game state.
+  memory — what this repo's `dpma/` tooling does via pointers. (Layout differs
+  on the current build vs the old `source/` builds, so the pointers need
+  re-mapping.)
 - **B2 (dump cipher tables):** after the handshake, snapshot the two ~256-byte
-  substitution tables from `Module` memory (anchored by #1245's offsets), then
-  apply them offline to the captured ciphertext. Validate against the known
-  keystream `7c 42 0d …`.
-Both use a browser hook on `window.Module`/`HEAPU8` and are far more reliable
-than static recovery.
+  substitution tables from WASM memory (anchored by #1245's offsets), then apply
+  them offline to the captured ciphertext. Validate against the known keystream
+  `7c 42 0d …`.
+
+**Access constraint discovered live (2026-06-22):** the current build **does not
+expose the heap to page scope** — `window.Module` contains only `{locateFile}`
+(no `HEAPU8`/`wasmMemory`/`asm`). The emscripten instance + its `WebAssembly.Memory`
+(export `U`) are kept inside the bundle's closure. So Path B requires hooking
+**before** the bundle runs:
+
+```js
+// install via a userscript @run-at document-start (runs before the bundle)
+const origInst = WebAssembly.instantiate;
+WebAssembly.instantiate = function(bytes, imports){
+  return origInst.call(this, bytes, imports).then(res => {
+    const inst = res.instance || res;
+    window.__wasmMem = inst.exports.U || Object.values(inst.exports).find(x=>x instanceof WebAssembly.Memory);
+    return res;
+  });
+};
+// also wrap WebAssembly.instantiateStreaming the same way
+// then: new Uint8Array(window.__wasmMem.buffer) is the live heap to scan/dump.
+```
+
+A simple console snippet injected after load is too late — the module is already
+instantiated. The hook must be a `document-start` userscript (or a navigate
+`initScript`).
 
 ## Recommendation
-Pursue **Path B** to actually decode traffic now; keep the #1245 static lead as
-the reference if a from-scratch cipher spec is later wanted.
+Build the `document-start` instantiate-hook userscript (above) to capture the
+heap, then pursue **B2**: locate + dump the substitution tables and validate
+against the known keystream. Full static reconstruction (Path A, func #1245) is
+the fallback if a from-scratch cipher spec is later wanted. Either way this is a
+multi-session effort, not a one-shot.

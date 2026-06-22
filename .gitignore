@@ -9,3 +9,11 @@ sessions/
 *.tmp
 dist/
 build/
+
+# Heavy RE artifacts (re-downloadable from diep.io; see docs/CIPHER-RE.md)
+analysis/node_modules/
+analysis/current/*.wasm
+analysis/current/*.wat
+analysis/current/*.js
+analysis/current/*.html
+analysis/package*.json

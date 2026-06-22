@@ -122,6 +122,27 @@ transient), and a same-session scan found **no** plain-f32 copy of the player's 
 besides 591660/591676 — reinforcing that entity positions are not stored as plain
 world-(x,y) f32 matching the render value.
 
+### Firing test inconclusive — light heap scanning has hit its limit
+Tried to confirm the entity array by creating bullets (firing) and counting
+arena-range floats per 64KB region. The only region that grew was `0x160000`
+(which contains the 1462272 lead), but only by +3, and that region's raw count
+fluctuates wildly frame-to-frame (56 → 16 within seconds) as entities move in/out
+of the magnitude filter. So **count-based confirmation is too noisy**, and bullets
+don't localize cleanly into a detectable f32 cluster.
+
+Conclusion: enumerating all entities can't be cracked by light heap scans alone.
+The reliable route is to recover the **entity-vector global pointer** (the modern
+equivalent of the old `dpma` `0x10a7c` — a global holding `{begin,end,cap}` of the
+entity `std::vector`), by either:
+- static RE of `diep.wasm` (find the function that iterates entities for render
+  and read the base pointer it loads), or
+- a heavier dynamic diff (snapshot the heap, Self-Destruct via the Sandbox Cheats
+  panel so the player entity is removed, snapshot again) — needs a foreground tab
+  with memory headroom for the 17.5MB snapshots.
+
+What DOES work reliably today: the player self position at the stable global
+`591660/591664`.
+
 ### Tooling limitation observed
 Full-heap `mem.snap()` (a 17.5 MB copy) intermittently throws
 `RangeError: Array buffer allocation failed` in a backgrounded/automated tab

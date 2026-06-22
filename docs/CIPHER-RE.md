@@ -116,3 +116,26 @@ heap, then pursue **B2**: locate + dump the substitution tables and validate
 against the known keystream. Full static reconstruction (Path A, func #1245) is
 the fallback if a from-scratch cipher spec is later wanted. Either way this is a
 multi-session effort, not a one-shot.
+
+## UPDATE (2026-06-22): cipher state is self-modifying — pivot recommended
+
+Dynamic capture works (Tampermonkey Sandbox Mode = **Raw** wins the document-start
+race; the probe captured the 17.5 MB heap). Findings from live dumps:
+
+- The two permutation tables (≈320 B apart) are the cipher's **per-connection
+  state**, seeded by the `0xf5` packet.
+- They are **self-modifying**: re-reading `sbox1` twice in the *same* session
+  showed exactly 3 positions changing (a 3-cycle of values `e8→e9→ea` at indices
+  `0x6e,0xe9,0xeb`). So the permutation evolves as bytes flow ⇒ **stream cipher**.
+- `sbox2` is **not** the inverse of `sbox1` ⇒ the two tables are **independent
+  send/recv states**, not an encrypt/decrypt pair.
+- Consequence: a single known-plaintext packet can't recover the keystream (it
+  depends on evolving state). Full crack = reversing func #1245's KSA+PRGA from
+  the 39-byte seed — a multi-session offline effort.
+
+**Pivot:** we proved decoded/plaintext data is directly readable from the heap
+(the achievements JSON was found verbatim). So the practical route to usable
+protocol/game data is **B1 — read decoded entities from WASM memory** (the
+`dpma/` approach), which needs no cipher crack. Recommended next step: build a
+memory-reader on top of the working probe (locate the entity/arena structures in
+the current build's heap and expose x/y/health/etc.).

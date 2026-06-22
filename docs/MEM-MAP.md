@@ -108,6 +108,20 @@ column should hold the player's Y at a fixed stride away. Next: with the tank
 offset is a clean fixed distance from 238864 → that distance = the SoA array
 width, which then lets every entity's (X[i], Y[i]) be read.
 
+### Second lead: region ~`0x164xxx` (1462272)
+The 2nd-densest arena-pair region. A scan for the player's Y value landed here
+(1462316), and a dump shows **per-record clusters of 4 varied coordinate floats**
+(e.g. `-342,-232,274,164`) separated by ~176-byte gaps of mostly zeros, and the
+values are **dynamic**. This is the most entity-array-like structure found so far
+(could be the visible-entity list or the minimap-marker array — values are small
+hundreds, possibly screen/minimap-relative, not world coords). To confirm: in
+Sandbox, **spawn or destroy a single shape** and watch which ~176-byte record
+appears/disappears here → that pins the array, its stride, and the field meaning.
+Note: across sessions the earlier `238864` X-candidate did NOT reproduce (it was
+transient), and a same-session scan found **no** plain-f32 copy of the player's X
+besides 591660/591676 — reinforcing that entity positions are not stored as plain
+world-(x,y) f32 matching the render value.
+
 ### Tooling limitation observed
 Full-heap `mem.snap()` (a 17.5 MB copy) intermittently throws
 `RangeError: Array buffer allocation failed` in a backgrounded/automated tab

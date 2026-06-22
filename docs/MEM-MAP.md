@@ -48,17 +48,31 @@ known quantity in-game and diff the heap to see which address changed.
   decoded data); not game state but a good "is the heap captured?" sanity check
   (`mem.find('7b 22 6e 61 6d 65')` → `{"name`).
 
-## Discovered fields (fill in as confirmed)
+## Discovered fields (confirmed)
 
-| Field | Offset within entity struct | Type | How confirmed | Confidence |
-|-------|-----------------------------|------|---------------|------------|
-| X position | TBD | f32 | move-diff | — |
-| Y position | TBD | f32 | move-diff | — |
-| Health | TBD | f32 | damage-diff | — |
-| … | | | | |
+**Player render-position struct** — located via move-diff + isolated-float filter,
+then confirmed by directional watch (X tracks left/right, Y tracks up/down).
+Example session absolute base = `0x906xx` (591660); re-anchor each load.
 
-(Offsets are relative to the entity struct base, which is stable within a
-session but its absolute address changes per load — always re-anchor via a scan.)
+| Field | Offset (rel. to base) | Type | Evidence | Confidence |
+|-------|-----------------------|------|----------|------------|
+| X position | +0 | f32 | +right / −left; stable on up/down | ✓ |
+| Y position | +4 | f32 | −up / +down; stable on left/right | ✓ |
+| const A | +8 | f32 | constant (~2592) — spawn/target? | ◐ |
+| const B | +12 | f32 | constant (~1960) — spawn/target? | ◐ |
+| X copy | +16 | f32 | mirrors X (render interpolation) | ✓ |
+| ? | +20 | f32 | varies (~1000) | ? |
+| velocity? | +24 | f32 | varies a lot on move | ◐ |
+| Y copy | +28 | f32 | mirrors Y | ✓ |
+
+So this is the **interpolated render position** (current + target copies). Health
+and the authoritative entity array are still TBD (next: find the array stride to
+enumerate all entities).
+
+Live read (this session): `mem.f32(591660)` = X, `mem.f32(591664)` = Y.
+
+(Offsets are relative to the struct base, which is stable within a session but
+its absolute address changes per load — always re-anchor via a move-diff scan.)
 
 ## Notes
 - The heap only grows; snapshot offsets stay valid within a session. Re-create

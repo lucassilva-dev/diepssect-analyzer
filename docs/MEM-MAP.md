@@ -89,6 +89,23 @@ Also ruled out: region ~`0x21000` (135168) looked dense in arena-range pairs but
 a dump shows a **sorted ascending lookup table** (1,1,2,2,3,…,173 as f32), not
 entity positions — a false positive of the density heuristic.
 
+### Key insight: positions are NOT stored as adjacent (x,y) float pairs
+A full-heap scan for any `(x,y)` pair matching the player's live position
+(within ±40) returns **only 591660** (the self/camera global). There is no
+second adjacent-float copy — so the logic entity array almost certainly stores
+positions as a **structure-of-arrays** (a contiguous array of all X's, separate
+from all Y's) or in a quantized/encoded form, not as interleaved `x,y` structs.
+Next attempts should scan for the player's **single X value** sitting inside an
+array of other varied arena-range floats (the X column), then find the parallel
+Y column at a fixed array-width offset.
+
+### Tooling limitation observed
+Full-heap `mem.snap()` (a 17.5 MB copy) intermittently throws
+`RangeError: Array buffer allocation failed` in a backgrounded/automated tab
+under game load. Differential scanning needs either a foreground tab with memory
+headroom, or a lighter snapshot (copy only a target region, or store per-word
+hashes instead of a full byte copy).
+
 ### Plan to find the logic entity array (next session)
 1. In **Sandbox** (controlled, few entities): spawn or destroy a shape and
    snapshot-diff to catch the array region that gains/loses an element.

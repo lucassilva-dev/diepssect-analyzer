@@ -99,6 +99,15 @@ Next attempts should scan for the player's **single X value** sitting inside an
 array of other varied arena-range floats (the X column), then find the parallel
 Y column at a fixed array-width offset.
 
+**Lead found:** scanning for the player's X value returns only 3 offsets — the
+self struct (591660), its render copy (591676), and **`238864`**, where the X
+sits **isolated, surrounded by zeros** (no adjacent Y). `238864` is the prime
+candidate for the **authoritative X in an SoA entity array**; the matching Y
+column should hold the player's Y at a fixed stride away. Next: with the tank
+**held still** (no drift), scan for the player's Y value and find the one whose
+offset is a clean fixed distance from 238864 → that distance = the SoA array
+width, which then lets every entity's (X[i], Y[i]) be read.
+
 ### Tooling limitation observed
 Full-heap `mem.snap()` (a 17.5 MB copy) intermittently throws
 `RangeError: Array buffer allocation failed` in a backgrounded/automated tab

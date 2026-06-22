@@ -96,6 +96,20 @@ A simple console snippet injected after load is too late — the module is alrea
 instantiated. The hook must be a `document-start` userscript (or a navigate
 `initScript`).
 
+**Live result (probe v0.2):** the userscript installs correctly and its globals
+are visible in the page world (`__probeStatus().installed === true`,
+`sandboxed === true`), and all three hooks are confirmed present on the page's
+`WebAssembly` (verified via `.toString()`). Yet `heapCaptured` stays `false` and
+no hook fires. The wasm is on the **main thread** (`diep.wasm` in main-thread
+resource timing; `crossOriginIsolated === false`, `SharedArrayBuffer` undefined →
+no worker/threads). Conclusion: **Tampermonkey (MV3) lost the document-start race
+— the bundle called `WebAssembly.instantiate` before the userscript installed the
+hook.** Remedy to try: Tampermonkey → Settings → (Advanced config) → **Inject
+Mode = `Instant`**, then hard-reload. If the race is still lost, a heavier
+pre-load injection is required (CDP `Page.addScriptToEvaluateOnNewDocument`, a
+proxy that rewrites the bundle, or a patched self-hosted build) — none of which a
+plain userscript can guarantee.
+
 ## Recommendation
 Build the `document-start` instantiate-hook userscript (above) to capture the
 heap, then pursue **B2**: locate + dump the substitution tables and validate

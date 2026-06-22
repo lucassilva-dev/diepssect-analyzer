@@ -78,6 +78,31 @@ Globals `602700/602704` are world **WIDTH/HEIGHT**, not counters.
    and sets `window.__entities`. Method A (render vector) first, Method B (hashmap
    full scan) as fallback / for the complete store.
 
+## LIVE VALIDATION (2026, Sandbox) — the chain WORKS
+Ran the recovered chain against live memory (diep-mem-reader probe):
+- `WORLD = 582904` confirmed; registry scan found **1 container at slot 3 =
+  584012 = exactly WORLD+1108** (the predicted CONTAINER). ✅
+- Occupancy bitmap (base+796) had **16 set bits → 16 entities**; the pager
+  (`node = page + (probe&255)*224`) resolved all 16 nodes, every one with
+  **node+116 == 6954** (the seeded validation key func 77 checks). ✅
+- IDs read at node+64+4/+8; renderable component ptr at node+172 valid for ~14/16.
+- The render vector (WORLD+1120 +676/+680) had only **1** element live (it's the
+  "single visible slot" the verifier flagged) — so the **hashmap full-scan is the
+  correct enumeration method**, as predicted.
+
+So: **entity enumeration is solved and validated** — `entity-reader.js` method B
+lists every entity node from memory, no cipher and no heavy scan.
+
+### Position/health are OBFUSCATED (next layer)
+Reading the entity's stored x/y as a plain f32 yields tiny/normalized values, not
+world coords, and none matched the live self-camera mirror (591660/591664). This
+matches the WAT note that positions go through `f32.reinterpret_i32` + a
+deobfuscation in func 82. So per-entity position/health/color are stored
+**obfuscated** (same theme as the network cipher) and need a deobfuscation pass to
+decode. A move-diff to isolate the field is hampered in Sandbox by constant ambient
+shape motion; do it on a controlled single moving entity, or RE func 82's transform.
+The plain player x/y remains available via the self mirror at 591660/591664.
+
 ## Provenance
 Workflow `diep-entity-re`: 6 parallel finders → synthesis → adversarial verify →
 recipe. 9 agents, ~520K tokens, 188 tool-uses. The verify phase caught and corrected

@@ -69,7 +69,34 @@ So this is the **interpolated render position** (current + target copies). Healt
 and the authoritative entity array are still TBD (next: find the array stride to
 enumerate all entities).
 
-Live read (this session): `mem.f32(591660)` = X, `mem.f32(591664)` = Y.
+Live read: `mem.f32(591660)` = X, `mem.f32(591664)` = Y.
+
+### Update: 591660 is a STABLE GLOBAL (self/camera), not an array element
+Confirmed across two independent sessions (different players) that the self
+position sits at the **same absolute offset 591660/591664** — i.e. it's a
+statically-allocated singleton (camera/self), not heap-allocated. Reliable anchor:
+scan for the one offset where `f32(o)==f32(o+16)` and `f32(o+4)==f32(o+28)` with
+`|x|,|y| > 50` → returns exactly `591660`. Read the live player x,y there.
+
+### Entity array: what it is NOT (ruled out)
+Scanning the heap for `(x,y)` pairs near the player found clusters at ~1.13M and
+~1.64M with stride 32, but a dump shows these are **render vertex buffers**:
+3 identical copies of a position (stride 32) followed by constant `u32` attribute
+words (`0xFA0007E7`, `0x624D5C58`, `0xE43A07F3` — packed color/UV). Not the logic
+array. The logic array has entities at **varied** positions (not all ≈ the tank).
+
+Also ruled out: region ~`0x21000` (135168) looked dense in arena-range pairs but
+a dump shows a **sorted ascending lookup table** (1,1,2,2,3,…,173 as f32), not
+entity positions — a false positive of the density heuristic.
+
+### Plan to find the logic entity array (next session)
+1. In **Sandbox** (controlled, few entities): spawn or destroy a shape and
+   snapshot-diff to catch the array region that gains/loses an element.
+2. Or scan heap windows for the one with the most **distinct** valid arena `(x,y)`
+   pairs at a regular stride (logic array = varied positions; render = clustered).
+3. Once a candidate entity is found, dump its struct, find the stride to the next
+   entity, then read base+len to enumerate all (position, then health/type/angle
+   by the same diff method).
 
 (Offsets are relative to the struct base, which is stable within a session but
 its absolute address changes per load — always re-anchor via a move-diff scan.)

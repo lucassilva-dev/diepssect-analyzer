@@ -1,0 +1,14 @@
+{
+  "name": "diepssect-analyzer",
+  "version": "1.0.0",
+  "description": "Comprehensive protocol analysis toolkit for diep.io reverse engineering",
+  "main": "scripts/reverse-engineer.js",
+  "scripts": {
+    "reverse-engineer": "node scripts/reverse-engineer.js",
+    "analyze": "node scripts/reverse-engineer.js analyze",
+    "test": "echo \"Tests not yet implemented\""
+  },
+  "keywords": ["diep.io", "protocol", "reverse-engineering"],
+  "author": "Reverse Engineering Team",
+  "license": "MIT"
+}

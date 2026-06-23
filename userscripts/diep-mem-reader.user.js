@@ -52,9 +52,11 @@
     try {
       const inst = res && (res.instance || res)
       if (inst && inst.exports) {
+        W.__wasmExports = inst.exports   // ALL exported wasm funcs/memory (for input injection / RE)
         const m = inst.exports.U || Object.values(inst.exports).find(x => x instanceof WA.Memory)
         if (m && m.buffer) { W.__wasmMem = m; captureSource = where
-          console.log('%c[mem-reader] captured WASM memory via ' + where + ':', 'color:#0f0', m.buffer.byteLength, 'bytes') }
+          console.log('%c[mem-reader] captured WASM memory + exports via ' + where + ':', 'color:#0f0', m.buffer.byteLength, 'bytes',
+            Object.keys(inst.exports).length, 'exports') }
       }
     } catch (e) {}
     return res

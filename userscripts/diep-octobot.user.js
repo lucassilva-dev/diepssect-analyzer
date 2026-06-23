@@ -22,9 +22,13 @@
  *   - Entity world pos = decode(render+144/+164) + camera(591660/591664); decode is the
  *     verified byte-permuting affine+XOR (sentinel decode(749705847)==0).
  *
- * USAGE: install, open a SANDBOX, spawn. Press  B  to toggle the bot on/off.
- *   Loadout helpers (run once from console or via keys): diepBot.maxStatsOcto()
- *   Calibrate aim once if shots miss: diepBot.AIM_SCALE (see notes).
+ * USAGE (turnkey): open a SANDBOX, then in the console run:
+ *     diepBot.start()
+ *   -> clicks Play, clicks sandbox "Max Level", maxes all stats, and turns the bot ON
+ *      after ~4s (so you can click the tank tree up to OCTO TANK in that window).
+ *   Manual toggle anytime: press  B . Config: diepBot (AIM_SCALE, FIRE, STRAFE, CHASE).
+ *   Calibrate aim once if shots miss: diepBot.AIM_SCALE (~0.5..1.5).
+ *   Individual helpers: diepBot.spawn() / .maxLevel() / .maxStats().
  */
 
 ;(() => {
@@ -138,16 +142,51 @@
   }
 
   // ---- loadout helpers ----
-  bot.maxStatsOcto = function () {
-    // Octo Tank path: Tank -> Triplet/Quad... the simplest reliable route is Max Level (sandbox)
-    // then upgrade to Octo via the tank-upgrade UI. Stat keys '1'..'8' = keyCodes 49..56.
-    // Max out the 8 stats by pressing each number key several times.
+  const sleep = ms => new Promise(r => setTimeout(r, ms))
+  // find a clickable DOM element whose text matches (Sandbox cheats / menu are DOM)
+  function clickByText(txt) {
+    const re = new RegExp(txt, 'i')
+    const els = [...document.querySelectorAll('button,div,span,a')]
+      .filter(e => e.offsetParent !== null && re.test((e.textContent || '').trim()) && (e.textContent || '').length < 40)
+    // prefer the smallest matching element (the actual button, not a container)
+    els.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length)
+    if (els[0]) { els[0].click(); return true }
+    return false
+  }
+
+  bot.spawn = function () {
+    if (!clickByText('^Play')) console.warn('[octobot] Play button not found (DOM) — click Play manually')
+  }
+
+  bot.maxStats = function () {
+    // stat keys '1'..'8' = keyCodes 49..56; hammer each to max
     let i = 0
     const id = setInterval(() => {
       for (let k = 49; k <= 56; k++) { key(k, true); key(k, false) }
-      if (++i > 8) clearInterval(id)
-    }, 120)
-    console.log('[octobot] hammering stat keys 1..8 (run sandbox Max Level + pick Octo Tank in the UI)')
+      if (++i > 10) clearInterval(id)
+    }, 100)
+  }
+
+  bot.maxLevel = function () {
+    // open the Sandbox "flask" cheats panel then click "Max Level" (both DOM)
+    if (!clickByText('Max Level')) {
+      // panel may be closed — the flask icon is a DOM button near top-left; click then retry
+      clickByText('Sandbox|Cheat')
+      setTimeout(() => { if (!clickByText('Max Level')) console.warn('[octobot] Max Level not found — open the flask panel and click it manually'); }, 200)
+    }
+  }
+
+  // ONE-CALL turnkey: spawn -> max level -> max stats -> bot ON.
+  // NOTE: picking Octo Tank specifically needs the canvas tank-tree (Tank->Quad->Octo);
+  // that UI is build-specific, so click those 1-2 tank upgrades yourself after maxLevel.
+  // Octo Tank canonical class id = 5. The bot fights well with any high-tier tank.
+  bot.start = async function () {
+    bot.spawn(); await sleep(1200)
+    bot.maxLevel(); await sleep(900)
+    bot.maxStats()
+    console.log('%c[octobot] spawned + maxed. Now click the tank tree to OCTO TANK, then press B (or set diepBot.on=true).', 'color:#0ff')
+    // auto-enable after a grace period so you can pick Octo
+    setTimeout(() => { bot.on = true; console.log('%c[octobot] ON — attacking', 'color:#f0f;font-weight:bold') }, 4000)
   }
 
   // ---- main loop + toggle ----

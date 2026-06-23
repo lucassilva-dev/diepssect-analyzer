@@ -3,7 +3,7 @@
 // @description  Captures the diep.io WASM heap and provides Cheat-Engine-style primitives (scan/diff/watch) to map the decoded game state in memory. Replaces "Diep WASM Probe".
 // @version      1.0
 // @namespace    *://diep.io/
-// @match        *://diep.io/
+// @match        *://diep.io/*
 // @run-at       document-start
 // @grant        unsafeWindow
 // ==/UserScript==

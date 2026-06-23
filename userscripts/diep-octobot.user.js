@@ -5,7 +5,7 @@
 //              exports. For private Sandbox use only (you vs the bot). Requires diep-mem-reader.
 // @version      0.1
 // @namespace    *://diep.io/
-// @match        *://diep.io/
+// @match        *://diep.io/*
 // @run-at       document-start
 // @grant        unsafeWindow
 // ==/UserScript==

@@ -3,7 +3,7 @@
 // @description  Autonomous aggressive bot for diep.io SANDBOX duels. Reads all entities from
 //              WASM memory and drives the tank (aim/move/fire) via the game's own WASM input
 //              exports. For private Sandbox use only (you vs the bot). Requires diep-mem-reader.
-// @version      0.2
+// @version      0.3
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -63,6 +63,10 @@
     } catch (e) {}
   }
   function releaseAll() { for (const k of [...bot._heldKeys]) key(k, false); }
+  // FIRE via the autofire memory byte (verified live). The ua(button) export does
+  // NOT register fire/movement live, but va (aim) + this autofire byte both work.
+  const AUTOFIRE = 560660
+  function autofire(on) { try { new DataView(W.__wasmMem.buffer).setUint8(AUTOFIRE, on ? 1 : 0) } catch (e) {} }
 
   // ---- memory + decode ----
   // Cache ONE DataView; rebuild only when the wasm memory grows (buffer detaches).
@@ -118,19 +122,22 @@
     if ((_frame++ & 3) === 0) _target = pickTarget()
     const t = _target
     if (t) { const R = u32(t.node + 172); if (ok(R)) { t.sx = decode(u32(R + 144)); t.sy = decode(u32(R + 164)) } }
-    if (!t) { releaseAll(); if (bot.FIRE) key(KEY.FIRE, false); return }
+    if (!t) { releaseAll(); autofire(false); return }
 
-    // AIM: target render coords are camera-relative; screen pixel = center + render*scale
+    // AIM: target render coords are camera-relative; screen pixel = center + render*scale.
+    // va() takes screen px * dpr; aimScreen multiplies by dpr, so pass raw px (px/dpr).
     const cv = document.querySelector('canvas')
     const cw = cv ? cv.width : window.innerWidth, ch = cv ? cv.height : window.innerHeight
     const px = cw / 2 + t.sx * bot.AIM_SCALE
     const py = ch / 2 + t.sy * bot.AIM_SCALE
-    aimScreen(px / dpr(), py / dpr())   // aimScreen multiplies by dpr; keep raw pixel
+    aimScreen(px / dpr(), py / dpr())
 
-    // FIRE
-    if (bot.FIRE) key(KEY.FIRE, true)
+    // FIRE (autofire byte — verified live)
+    if (bot.FIRE) autofire(true)
 
-    // MOVE: chase toward target with a circle-strafe
+    // MOVE: chase via WASD. NOTE: the ua(keyCode) export does not register movement
+    // live on the current build (aim+fire do); chase is a no-op until the key-state
+    // table (mem 560468/560472) writer is reversed. Kept for when that lands.
     if (bot.CHASE) {
       const dz = bot.targetDeadzone
       // base chase direction (render +Y is down, +X is right)
@@ -202,7 +209,7 @@
   W.addEventListener('keydown', e => {
     if (e.key === 'b' || e.key === 'B') {
       bot.on = !bot.on
-      if (!bot.on) { releaseAll(); key(KEY.FIRE, false) }
+      if (!bot.on) { releaseAll(); autofire(false) }
       console.log('%c[octobot] ' + (bot.on ? 'ON — attacking' : 'OFF'), 'color:#f0f;font-weight:bold')
     }
   })

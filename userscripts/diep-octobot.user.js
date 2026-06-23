@@ -3,7 +3,7 @@
 // @description  Autonomous aggressive bot for diep.io SANDBOX duels. Reads all entities from
 //              WASM memory and drives the tank (aim/move/fire) via the game's own WASM input
 //              exports. For private Sandbox use only (you vs the bot). Requires diep-mem-reader.
-// @version      0.1
+// @version      0.2
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -65,12 +65,13 @@
   function releaseAll() { for (const k of [...bot._heldKeys]) key(k, false); }
 
   // ---- memory + decode ----
-  const heap = () => new Uint8Array(W.__wasmMem.buffer)
-  const dvm = () => new DataView(W.__wasmMem.buffer)
-  const u8 = a => dvm().getUint8(a >>> 0), u16 = a => dvm().getUint16(a >>> 0, true)
-  const u32 = a => dvm().getUint32(a >>> 0, true), f32 = a => dvm().getFloat32(a >>> 0, true)
-  const HEAPLEN = () => W.__wasmMem.buffer.byteLength
-  const ok = p => { p >>>= 0; return p > 0 && p < HEAPLEN() - 256 }
+  // Cache ONE DataView; rebuild only when the wasm memory grows (buffer detaches).
+  // Recreating a view per read in a 65536-iter loop @60fps was the GC/OOM driver.
+  let _buf = null, _dv = null, _len = 0
+  const DV = () => { const b = W.__wasmMem.buffer; if (b !== _buf) { _buf = b; _dv = new DataView(b); _len = b.byteLength } return _dv }
+  const u8 = a => DV().getUint8(a >>> 0), u16 = a => DV().getUint16(a >>> 0, true)
+  const u32 = a => DV().getUint32(a >>> 0, true), f32 = a => DV().getFloat32(a >>> 0, true)
+  const ok = p => { p >>>= 0; DV(); return p > 0 && p < _len - 256 }
   function decode(v) {
     v >>>= 0; const h = v >>> 16, t = v >>> 24
     const b2 = ((((v + Math.imul(h, -82)) | 0) - (-64)) ^ 169) & 0xFF
@@ -85,7 +86,7 @@
   const WORLD = 582904, base = WORLD + 1120, bm = base + 796
   function entities() {
     const out = []
-    for (let probe = 0; probe < 65536 && out.length < 600; probe++) {
+    for (let probe = 0; probe < 16384 && out.length < 400; probe++) {  // bitmap = 16384 bits
       if (!((u8(bm + (probe >> 3)) >> (probe & 7)) & 1)) continue
       const page = u32(base + 6940 + ((probe >> 8) << 2)); if (!ok(page)) continue
       const node = (page + (probe & 255) * 224) >>> 0; if (!ok(node) || u16(node + 116) !== 6954) continue
@@ -109,10 +110,14 @@
   }
 
   // ---- one bot tick ----
-  let strafeDir = 1, strafeT = 0
+  let strafeDir = 1, strafeT = 0, _frame = 0, _target = null
   function tick() {
     if (!bot.on || !ready()) return
-    const t = pickTarget()
+    // Heavy full enumeration only every 4th frame; refresh the cached target's
+    // position cheaply each frame (read its own node, no full scan) to keep aim live.
+    if ((_frame++ & 3) === 0) _target = pickTarget()
+    const t = _target
+    if (t) { const R = u32(t.node + 172); if (ok(R)) { t.sx = decode(u32(R + 144)); t.sy = decode(u32(R + 164)) } }
     if (!t) { releaseAll(); if (bot.FIRE) key(KEY.FIRE, false); return }
 
     // AIM: target render coords are camera-relative; screen pixel = center + render*scale

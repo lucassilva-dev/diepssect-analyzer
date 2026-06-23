@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Diep Memory Reader (RE toolkit)
 // @description  Captures the diep.io WASM heap and provides Cheat-Engine-style primitives (scan/diff/watch) to map the decoded game state in memory. Replaces "Diep WASM Probe".
-// @version      1.0
+// @version      1.1
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -66,14 +66,19 @@
   if (WA.instantiateStreaming) { const oS = WA.instantiateStreaming; WA.instantiateStreaming = function (a, b) { return oS.call(this, a, b).then(r => grab(r, 'instantiateStreaming')) } }
   try { const OI = WA.Instance; const Wd = function (m, i) { const inst = new OI(m, i); grab(inst, 'new Instance'); return inst }; Wd.prototype = OI.prototype; WA.Instance = Wd } catch (e) {}
 
-  // WebSocket capture (ciphertext frames; useful for handshake/seed)
+  // WebSocket capture (ciphertext frames; useful for handshake/seed).
+  // Bounded ring buffer — diep sends many frames/sec; an unbounded array = OOM in minutes.
+  // Disable entirely with  window.__capture = false  (the bot/entity-reader don't need it).
+  W.__capture = (W.__capture !== false)
+  const MAX_CAPS = 600
+  const pushCap = (rec) => { const a = W.__caps; a.push(rec); if (a.length > MAX_CAPS) a.splice(0, a.length - MAX_CAPS) }
   try {
     const OWS = W.WebSocket
     const H = function (u, p) {
       const ws = p === undefined ? new OWS(u) : new OWS(u, p)
       const s = ws.send.bind(ws)
-      ws.send = function (d) { try { let b = d instanceof ArrayBuffer ? d : (d && d.buffer); if (b) W.__caps.push({ dir: 'out', t: Date.now(), bytes: new Uint8Array(b.slice ? b.slice(0) : b) }) } catch (e) {} return s(d) }
-      ws.addEventListener('message', e => { try { if (e.data instanceof ArrayBuffer) W.__caps.push({ dir: 'in', t: Date.now(), bytes: new Uint8Array(e.data) }) } catch (err) {} })
+      ws.send = function (d) { try { if (W.__capture) { let b = d instanceof ArrayBuffer ? d : (d && d.buffer); if (b) pushCap({ dir: 'out', t: Date.now(), bytes: new Uint8Array(b.slice ? b.slice(0) : b) }) } } catch (e) {} return s(d) }
+      ws.addEventListener('message', e => { try { if (W.__capture && e.data instanceof ArrayBuffer) pushCap({ dir: 'in', t: Date.now(), bytes: new Uint8Array(e.data) }) } catch (err) {} })
       return ws
     }
     H.prototype = OWS.prototype

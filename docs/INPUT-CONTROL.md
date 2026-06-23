@@ -34,8 +34,10 @@ So: prefer the **exports** (`ua`/`va`) — they populate the hashtable/latches c
 memory writes to 560456/560460 also steer aim, but movement/fire are easier via `ua()`.
 
 ## ⚠️ The movement gate — `560772` (why `ua()` can look like a no-op)
-Workflow `diep-movement-re` (verify phase, WAT-evidenced) settled why `ua(W/A/S/D, 1)` once
-appeared to do nothing while aim/fire worked:
+**LIVE-VALIDATED (2026, Sandbox):** with `i32@560772=0` then `ua(68,1)` held ~800ms, the player
+world X (`f32@591660`) moved **242.8 → 418.2 (dx=+175.4, dy=0.0)** — clean rightward movement.
+Movement is solved end-to-end. Workflow `diep-movement-re` (verify phase, WAT-evidenced) settled
+why `ua(W/A/S/D, 1)` once appeared to do nothing while aim/fire worked:
 
 - `ua(code,state)` = func 1583 = `_cpp_set_keybind_state` **does write correctly** — it stores
   `state` into the held-key node (offset 12) inside the hashmap @560468, exactly where func 93

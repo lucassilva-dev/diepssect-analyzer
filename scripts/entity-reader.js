@@ -1,114 +1,85 @@
-/* diep.io live entity enumerator — paste into the diep.io console (window.mem from
-   the diep-mem-reader userscript must be present).
-
-   Recovered by static RE of diep.wasm (analysis/current/diep.wat) and adversarially
-   verified. See docs/WASM-ENTITY-RE.md for the full pointer chain + evidence.
-
-   Verified WAT anchors:
-     func 99  @63345  -> WORLD = i32.const 582904 (address-of constant, NO deref)
-     func 77  @11287  -> registry @467744 ; container+12 ; occupancy bitmap @+796
-     func 186 @85222  -> page dir @+6940 (idx (probe>>8)<<2) ; node = page + (probe&255)*224
-     func 528 @405786 -> base=WORLD+1120 ; begin=load+676 end=load+680 ;
-                         ref=u32(slot) ; node=ref+64 ; renderable=u32(node+172) ; color=u32(node+156)
-   Entity-node stride = 224 bytes (57344-byte pages, 256 nodes/page).
-
-   OPEN (resolve live by move-diff): exact x/y offset on the renderable component
-   (node+172) is not pinned in the WAT; health component (node+176) is unconfirmed.
-*/
+/* ============================================================================
+ * diep.io LIVE ENTITY READER  (validated 2026)
+ * Enumerates every entity from WASM memory and decodes position / health / type
+ * — no network cipher, no heavy heap scan. Requires window.mem from the
+ * diep-mem-reader userscript (Tampermonkey Sandbox Mode = Raw).
+ *
+ * Recovered by static RE of analysis/current/diep.wat (two multi-agent workflows
+ * + adversarial verification) and confirmed live:
+ *   - Enumeration chain: WORLD=582904; base=WORLD+1120 (=entity-container+12);
+ *     occupancy bitmap @ base+796; page dir @ base+6940 (idx (probe>>8)<<2);
+ *     node = page + (probe&255)*224; stride 224; validation key u16@node+116==6954.
+ *   - Obfuscated f32 decode (func 82/528/1298): byte-permuting affine+XOR, fixed
+ *     constants, then reinterpret bits as f32. SELF-CHECK: decode(749705847)==0.0.
+ *   - Render position (camera-relative) on the renderable component (node+172):
+ *     X @ +144, Y @ +164 (obfuscated). WORLD = render + camera(591660/591664).
+ *     Live-validated: shapes decode to sane world coords around the player.
+ *   - Health: PLAIN ratio (health/maxHealth, [0,1]) at (node+176)+48 (no maxHP client-side).
+ *   - Type: draw-callback table index at (node+172)+176 (category discriminator;
+ *     no flat int enum — label categories by observing distinct values live).
+ * ========================================================================== */
 (function () {
-  const m = window.mem;
-  if (!m || !m.u32) { console.error('window.mem not found (install diep-mem-reader userscript)'); return null; }
-  const HEAP = m.heap().length;
-  const ok = p => Number.isFinite(p) && p > 0 && p < HEAP;
+  const M = window.mem;
+  if (!M) { console.error('window.mem missing (install diep-mem-reader, Sandbox=Raw)'); return null; }
+  const u8 = a => M.u8(a >>> 0), u16 = a => M.u16(a >>> 0), u32 = a => M.u32(a >>> 0), f32 = a => M.f32(a >>> 0);
+  const HEAP = M.heap().length;
+  const ok = p => { p >>>= 0; return p > 0 && p < HEAP - 256; };
 
-  const WORLD = 582904;          // func 99 constant
-  const CBASE = WORLD + 1120;    // inner vector base (CONTAINER+12), used by func 528 & 774
-  const VEC_BEGIN = CBASE + 676; // render vector begin   (func 528 off676)
-  const VEC_END   = CBASE + 680; // render vector end     (func 528 off680)
-  const O_RENDER  = 172;         // renderable component ptr (func 528 off172)
-  const O_COLOR   = 156;         // style/color id          (func 528 off156)
-  const O_HEALTHC = 176;         // health component ptr (UNCONFIRMED)
-  const STRIDE    = 224;
-  const REF_ADJ   = 64;          // node = ref + 64 (func 528 `i32.const -64 i32.sub`)
-  const CAP       = 2000;
+  // --- obfuscated-f32 decode (verbatim from func 82) ---
+  const _dv = new DataView(new ArrayBuffer(4));
+  function decode(v) {
+    v >>>= 0; const h = v >>> 16, t = v >>> 24;
+    const b2 = ((((v + Math.imul(h, -82)) | 0) - (-64)) ^ 169) & 0xFF;
+    const mid = ((((h << 8) - (t << 14)) | 0) + 20736) & 0xFF00;
+    const b0 = (t + 208) & 0xFF;
+    const b3 = (((((Math.imul(v, 125)) + (v >>> 8)) | 0) - 71) ^ 110) & 0xFF;
+    const p = (((b3 << 24) | (b2 << 16) | mid | b0) ^ 252) >>> 0;
+    _dv.setUint32(0, p, true); return _dv.getFloat32(0, true);
+  }
+  if (decode(749705847) !== 0) console.warn('[entity-reader] decode self-check FAILED');
 
-  function readNode(node) {
-    if (!ok(node)) return null;
-    const idTime    = m.u16(node + 64 + 4);  // id 2-tuple at ref(=node+64): time@+4
-    const idCounter = m.u16(node + 64 + 8);  //                              counter@+8
-    const renderable = m.u32(node + O_RENDER);
-    const color      = m.u32(node + O_COLOR);
-    let x = NaN, y = NaN, posOff = -1;
-    // Position lives in the renderable component (offset TBD). Probe candidate slots.
-    if (ok(renderable)) {
-      const cand = [8, 88, 120, 128, 152];
-      for (const off of cand) {
-        const vx = m.f32(renderable + off);
-        const vy = m.f32(renderable + off + 4);
-        if (Number.isFinite(vx) && Number.isFinite(vy) &&
-            Math.abs(vx) < 1e7 && Math.abs(vy) < 1e7 && (vx || vy)) {
-          x = vx; y = vy; posOff = off; break;
-        }
-      }
-    }
-    let health = NaN;
-    const hc = m.u32(node + O_HEALTHC);
-    if (ok(hc)) { const h = m.f32(hc + 48); if (Number.isFinite(h)) health = h; }
-    return {
-      idHex: ((idTime >>> 0).toString(16).padStart(4, '0') + ':' +
-              (idCounter >>> 0).toString(16).padStart(4, '0')),
-      x, y, health, type: color >>> 0, node, renderable, posOff
-    };
+  const WORLD = 582904;
+  const base = WORLD + 1120;          // = entity-container + 12 (address, NOT a deref)
+  const bm = base + 796;              // occupancy bitmap
+  const camX = f32(591660), camY = f32(591664); // player camera = player world pos
+
+  const f64 = a => { const h = M.heap(); return new DataView(h.buffer, h.byteOffset + (a >>> 0), 8).getFloat64(0, true); };
+  const cl = x => Math.max(0, Math.min(1, x));
+  function healthRatio(node) {
+    const H = u32(node + 176);
+    if (!ok(H)) return NaN;
+    if (u8(H + 72) === 1) return cl(f32(H + 48));
+    // smoothstep interpolation (func 285); g[541760] is the frame clock
+    const tt = cl((f64(541760) - f64(H + 56)) / 100);
+    const s = tt * tt * (3 - 2 * tt);
+    const cur = f32(H + 48), from = f32(H + 68);
+    return cl((cur - from) * s + from);
   }
 
-  // ---- METHOD A: render vector walk (per-frame visible set) ----
-  function viaRenderVector() {
-    const begin = m.u32(VEC_BEGIN), end = m.u32(VEC_END);
-    const out = [];
-    if (!ok(begin) || !Number.isFinite(end) || end < begin) return out;
-    const n = Math.min((end - begin) >>> 2, CAP);
-    for (let i = 0; i < n; i++) {
-      const slot = begin + i * 4;
-      if (!ok(slot)) break;
-      const ref = m.u32(slot);
-      if (!ok(ref)) continue;
-      const e = readNode(ref + REF_ADJ);
-      if (e) out.push(e);
-    }
-    return out;
+  const ents = [];
+  for (let probe = 0; probe < 65536 && ents.length < 2000; probe++) {
+    if (!((u8(bm + (probe >> 3)) >> (probe & 7)) & 1)) continue;
+    const page = u32(base + 6940 + ((probe >> 8) << 2));
+    if (!ok(page)) continue;
+    const node = (page + (probe & 255) * 224) >>> 0;
+    if (!ok(node) || u16(node + 116) !== 6954) continue;
+    const R = u32(node + 172);
+    let sx = NaN, sy = NaN, type = 0;
+    if (ok(R)) { sx = decode(u32(R + 144)); sy = decode(u32(R + 164)); type = u32(R + 176) >>> 0; }
+    ents.push({
+      probe, node,
+      screenX: +sx.toFixed(1), screenY: +sy.toFixed(1),         // camera-relative (for radar)
+      worldX: +(sx + camX).toFixed(1), worldY: +(sy + camY).toFixed(1), // absolute
+      health: +healthRatio(node).toFixed(3),                   // 0..1 ratio
+      type,                                                     // draw-callback index = category
+      idTime: u16(node + 64 + 4), idCounter: u16(node + 64 + 8),
+    });
   }
 
-  // ---- METHOD B: canonical hashmap full scan (authoritative store) ----
-  function viaHashmap() {
-    const out = [], seen = new Set();
-    for (let s = 0; s < 2048; s++) {
-      const container = m.u32(467744 + s * 4);
-      if (!ok(container)) continue;
-      const base = container + 12;
-      for (let probe = 0; probe < 16384 && out.length < CAP; probe++) {
-        const word = m.u32(base + 796 + ((probe >> 3) & ~3));
-        if (!((word >>> (probe & 31)) & 1)) continue;
-        const page = m.u32(base + 6940 + ((probe >> 8) << 2));
-        if (!ok(page)) continue;
-        const node = page + (probe & 255) * STRIDE;
-        if (!ok(node) || seen.has(node)) continue;
-        seen.add(node);
-        const e = readNode(node);
-        if (e) out.push(e);
-      }
-    }
-    return out;
-  }
-
-  let list = viaRenderVector();
-  let method = 'render-vector';
-  if (!list.length) { console.warn('render vector empty; trying hashmap full scan'); list = viaHashmap(); method = 'hashmap'; }
-  if (!list.length) {
-    console.warn('No entities via known anchors. Self pos for reference: x=' +
-      m.f32(591660) + ' y=' + m.f32(591664));
-  }
-
-  console.log('entities:', list.length, '(via ' + method + ')', list.slice(0, 20));
-  window.__entities = list;
-  return { method, count: list.length, sample: list.slice(0, 20) };
+  const types = {}; ents.forEach(e => types[e.type] = (types[e.type] || 0) + 1);
+  console.log(`[entity-reader] ${ents.length} entities; camera (player) = (${camX.toFixed(0)}, ${camY.toFixed(0)})`);
+  console.log('[entity-reader] type-index -> count:', types);
+  try { console.table(ents.map(e => ({ worldX: e.worldX, worldY: e.worldY, health: e.health, type: e.type }))); } catch (e) {}
+  window.diepEntities = ents;
+  return { count: ents.length, camera: { x: camX, y: camY }, entities: ents };
 })();

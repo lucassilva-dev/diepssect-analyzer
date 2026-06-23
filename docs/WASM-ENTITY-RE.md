@@ -93,15 +93,27 @@ Ran the recovered chain against live memory (diep-mem-reader probe):
 So: **entity enumeration is solved and validated** — `entity-reader.js` method B
 lists every entity node from memory, no cipher and no heavy scan.
 
-### Position/health are OBFUSCATED (next layer)
-Reading the entity's stored x/y as a plain f32 yields tiny/normalized values, not
-world coords, and none matched the live self-camera mirror (591660/591664). This
-matches the WAT note that positions go through `f32.reinterpret_i32` + a
-deobfuscation in func 82. So per-entity position/health/color are stored
-**obfuscated** (same theme as the network cipher) and need a deobfuscation pass to
-decode. A move-diff to isolate the field is hampered in Sandbox by constant ambient
-shape motion; do it on a controlled single moving entity, or RE func 82's transform.
-The plain player x/y remains available via the self mirror at 591660/591664.
+### Position/health/type — DECODED & live-validated ✅
+A second workflow (`diep-entity-deobf`) recovered the in-memory obfuscation and it
+was confirmed live:
+- **decode_f32(v)** = byte-permuting affine+XOR over v's bytes, then reinterpret as
+  f32 (verbatim func 82/528/1298). **Self-check: decode_f32(749705847) == 0.0**
+  (the obf-zero sentinel — the same constant func 793 stores at 591644). Hardcoded
+  constants only; no key/salt.
+- **Position** (renderable component `node+172`): X = decode(u32@R+144),
+  Y = decode(u32@R+164). These are **camera-relative** (screen) coords →
+  **world = render + camera(591660/591664)**. Live: shapes decoded to sane world
+  positions around the player (e.g. (-3184,-690), (-2644,-858)).
+- **Health**: PLAIN smoothstep-interpolated ratio in [0,1] at `(node+176)+48`
+  (no maxHealth client-side; bar shows only when <1).
+- **Type**: draw-callback table index at `(node+172)+176` (category discriminator;
+  e.g. 0 vs 126 live). No flat int enum — label categories by observing values.
+
+So the full reader (`scripts/entity-reader.js`) outputs, per entity:
+`{worldX, worldY, screenX, screenY, health, type, idTime, idCounter}` — straight
+from memory, no cipher. **Entity decoding is complete.** Caveats: render coords are
+populated for on-screen entities (off-screen → null render ptr); type indices need
+live labeling; `node+156` is color OR angle depending on component role.
 
 ## Provenance
 Workflow `diep-entity-re`: 6 parallel finders → synthesis → adversarial verify →

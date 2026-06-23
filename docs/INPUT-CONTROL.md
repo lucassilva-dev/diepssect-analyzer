@@ -33,6 +33,36 @@ WAT evidence (`analysis/current/diep.wat`):
 So: prefer the **exports** (`ua`/`va`) — they populate the hashtable/latches correctly. Raw
 memory writes to 560456/560460 also steer aim, but movement/fire are easier via `ua()`.
 
+## ⚠️ The movement gate — `560772` (why `ua()` can look like a no-op)
+Workflow `diep-movement-re` (verify phase, WAT-evidenced) settled why `ua(W/A/S/D, 1)` once
+appeared to do nothing while aim/fire worked:
+
+- `ua(code,state)` = func 1583 = `_cpp_set_keybind_state` **does write correctly** — it stores
+  `state` into the held-key node (offset 12) inside the hashmap @560468, exactly where func 93
+  reads it (`i32.load8_u offset=12 & 1`). It is **idempotent + persistent**: one `ua(87,1)` stays
+  held until `ua(87,0)`; no per-frame re-press needed.
+- `func 1298` builds the move bitfield from `call 93`: **W87→2, A65→4, S83→8, D68→16** (arrows
+  38/37/40/39 as fallbacks), CONFIRMED at WAT L919247-919330.
+- **THE CATCH:** each of those reads is guarded by `i32.const 560772 i32.load br_if` — when the
+  **text-input gate i32@560772 != 0**, func 1298 branches past **ALL** WASD reads. A focused
+  chat/name box (or an unfocused/automated tab) can leave it set. **Fix: write `560772 = 0` every
+  tick** before relying on movement. Aim/fire are unaffected because 560456/560460/560660 are plain
+  globals read unconditionally — which is exactly why they worked when movement didn't.
+- A second gate (func 115, cached @561232 valid@561233) diverts func 1298 to a UI/overlay path when
+  a menu is open — so test in normal play, tank spawned, canvas focused.
+- REFUTED dead-ends (do not implement): the "reset_keys race / map wipe" theory — export `ka`
+  (func 1258) is **never called** anywhere in the bundle and its arm flag @560480 inits to 0; the
+  map never gets wiped.
+
+Minimal proof (paste in console, spawned, in Sandbox):
+```js
+const ex=window.__wasmExports, dv=new DataView(window.__wasmMem.buffer);
+dv.setInt32(560772,0,true); dv.setUint8(560528,0);           // open gate + mouse aim
+const x0=dv.getFloat32(591660,true); ex.ua(68,1);            // hold D (right)
+setTimeout(()=>{const x1=dv.getFloat32(591660,true); ex.ua(68,0);
+  console.log('dx=',(x1-x0).toFixed(1), Math.abs(x1-x0)>0.5?'MOVED ✅':'no move ❌');},800);
+```
+
 ## Used by
 `userscripts/diep-octobot.user.js` (autonomous Sandbox bot: read entities → aim/move/fire
 via these exports). Sandbox / private use only.

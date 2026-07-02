@@ -4,7 +4,7 @@
 //              WASM memory and DRIVES the tank (aim / move / fire) through the game's own WASM
 //              input exports. Modes: 'fallen' (Booster rammer that hunts the player) and 'octo'
 //              (turret/orbit shooter). For private Sandbox use only. Needs diep-mem-reader.
-// @version      0.5
+// @version      0.6
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -30,9 +30,9 @@
  *            (func 1298 skips ALL WASD reads otherwise) — forced 0 every tick.
  *
  * MODES:
- *   'fallen' — Fallen-Booster-style rammer: locks onto the PLAYER tank (u32[node+168]!=0 =>
- *              has a name component => player), aims AT it, holds fire (recoil thrust) and
- *              drives into it. Flees (aim+thrust away) below retreatHP. Build: body dmg/HP/speed.
+ *   'fallen' — Fallen-Booster-style rammer: locks onto NAMED actors (u32[node+168]!=0 = has a
+ *              server-sent nametag: player tanks — and named AI bosses), aims AT the target,
+ *              holds fire (recoil thrust) and rams. Flees below retreatHP. Build: body/HP/speed.
  *   'octo'   — orbiting turret: nearest target, circle-strafe, keep distance, shoot.
  *
  * USAGE: sandbox -> spawn -> console:  diepBot.start('fallen')
@@ -59,15 +59,13 @@
     on: false,
     MODE: 'fallen',        // 'fallen' (rammer, hunts the player) | 'octo' (orbit turret)
     FIRE: true,
-    PREFER_PLAYERS: true,  // lock onto player tanks (u32[node+168]!=0) when any is on screen
-    LEAD: false,           // lead aim by target velocity (offsets unverified; opt-in)
+    PREFER_PLAYERS: true,  // lock onto named actors first (players/bosses: u32[node+168]!=0)
     // geometry (world units; render coords are camera-relative world units)
     keepDist: 230,         // octo: orbit range
     tooClose: 130,         // octo: back off inside this
     farmFire: 900,         // octo: fire only within this range (fallen always fires = thrust)
     retreatHP: 0.20,       // flee below this health ratio
     strafeGain: 0.85, strafeFlip: 55,
-    leadFactor: 6,
     deadzone: 0.10,        // normalized move threshold
     AIM_ZOOM: true,        // scale aim offset by live zoom decode(u32@591572)
     AIM_SCALE: 1.0,
@@ -124,28 +122,78 @@
   const camX = () => f32(591660), camY = () => f32(591664)
   function zoom() { if (!bot.AIM_ZOOM) return 1; const z = decode(u32(591572)); return (Number.isFinite(z) && z > 0 && z < 100) ? z : 1 }
 
-  // ---- enumerate entities (validated hashmap chain) ----
-  const WORLD = 582904, base = WORLD + 1120, bm = base + 796
+  // ---- entity store base — DISCOVERED, not hardcoded (v0.6 fix) ----
+  // The live entity container is PER-ARENA: sometimes the static WORLD+1108 object, sometimes a
+  // heap container registered in the id->container ring @467744 (func 77/266). Hardcoding the
+  // static base made the bot see 0 entities in fresh arenas (=> it stood still doing nothing).
+  // We score every candidate base (container+12) by live-bitmap nodes and adopt the best;
+  // re-scan automatically if the store goes dry (arena switch).
+  // Node liveness: bitmap bit + generation u16@node+116 != 6875. (6875 encodes generation 0 =
+  // never used; the old ===6954 check meant generation==1 and silently dropped reused slots.)
+  const WORLD = 582904, STATIC_BASE = WORLD + 1120, REG = 467744
+  let BASE = 0, BASE_SRC = 'none', _dryScans = 0
+  const liveNode = nd => ok(nd) && u16(nd + 116) !== 6875
+  function countBase(b) {
+    if (!ok(b + 7196)) return 0
+    let n = 0
+    try {
+      for (let pr = 0; pr < 16384; pr++) {
+        if (!((u8(b + 796 + (pr >> 3)) >> (pr & 7)) & 1)) continue
+        const pg = u32(b + 6940 + ((pr >> 8) << 2)); if (!ok(pg)) continue
+        if (liveNode((pg + (pr & 255) * 224) >>> 0)) n++
+      }
+    } catch (e) {}
+    return n
+  }
+  function findBase() {
+    const seen = new Set([STATIC_BASE]), cands = [STATIC_BASE]
+    for (let i = 0; i < 65536 && cands.length < 64; i++) {
+      const c = u32(REG + i * 4); if (!ok(c)) continue
+      const b = (c + 12) >>> 0
+      if (!seen.has(b)) { seen.add(b); cands.push(b) }
+    }
+    let best = 0, bestN = 0
+    for (const b of cands) { const n = countBase(b); if (n > bestN) { bestN = n; best = b } }
+    if (best) { BASE = best; BASE_SRC = (best === STATIC_BASE ? 'static' : 'registry') }
+    return bestN
+  }
   function entities() {
     const out = []
+    if (!BASE && !findBase()) return out
     for (let probe = 0; probe < 16384 && out.length < 400; probe++) {
-      if (!((u8(bm + (probe >> 3)) >> (probe & 7)) & 1)) continue
-      const page = u32(base + 6940 + ((probe >> 8) << 2)); if (!ok(page)) continue
-      const node = (page + (probe & 255) * 224) >>> 0; if (!ok(node) || u16(node + 116) !== 6954) continue
+      if (!((u8(BASE + 796 + (probe >> 3)) >> (probe & 7)) & 1)) continue
+      const page = u32(BASE + 6940 + ((probe >> 8) << 2)); if (!ok(page)) continue
+      const node = (page + (probe & 255) * 224) >>> 0; if (!liveNode(node)) continue
       const R = u32(node + 172); if (!ok(R)) continue
       const rx = decode(u32(R + 144)), ry = decode(u32(R + 164))
       if (!Number.isFinite(rx) || !Number.isFinite(ry)) continue
-      const vx = f32(R + 132), vy = f32(R + 172)
       out.push({
-        node, R, ox: rx, oy: ry,
-        vx: Number.isFinite(vx) ? vx : 0, vy: Number.isFinite(vy) ? vy : 0,
-        dist: Math.hypot(rx, ry),
-        isPlayer: ok(u32(node + 168)),   // name/identity component present => player tank
+        node, R, ox: rx, oy: ry, dist: Math.hypot(rx, ry),
+        named: ok(u32(node + 168)),   // server-sent nametag => player tank (or a named AI boss)
       })
     }
+    if (!out.length) { if (++_dryScans >= 15) { _dryScans = 0; findBase() } } else _dryScans = 0
     return out
   }
-  function findSelf(es) { let best = null; for (const e of es) if (e.dist < 60 && (!best || e.dist < best.dist)) best = e; return best }
+  // self = the node the local camera follows (raw u16 id match on the camera object from the
+  // vector @BASE+676; verified func-77 path). u16(cam+68)==6875 => the local tank is DEAD.
+  function cameraObj() {
+    const beg = u32(BASE + 676), end = u32(BASE + 680)
+    if (!ok(beg) || beg === end) return 0
+    const cam = u32(beg)
+    return ok(cam) ? cam : 0
+  }
+  function selfDead() { if (!BASE) return false; const c = cameraObj(); return c ? u16(c + 68) === 6875 : false }
+  function findSelf(es) {
+    const c = cameraObj()
+    if (c) {
+      const g = u16(c + 68), k = u16(c + 72)
+      for (const e of es) if (u16(e.node + 116) === g && u16(e.node + 120) === k) return e
+    }
+    let best = null
+    for (const e of es) if (e.dist < 60 && (!best || e.dist < best.dist)) best = e
+    return best
+  }
   function selfHealth() {
     const s = bot._self; if (!s) return 1
     const H = u32(s.node + 176); if (!ok(H)) return 1
@@ -154,7 +202,7 @@
   function pickTarget(es, self) {
     const cands = es.filter(e => e !== self && e.dist > 40)
     if (!cands.length) return null
-    const players = cands.filter(e => e.isPlayer)
+    const players = cands.filter(e => e.named)
     const pool = (bot.PREFER_PLAYERS && players.length) ? players : cands
     pool.sort((a, b) => a.dist - b.dist)
     return pool[0]
@@ -164,7 +212,6 @@
     const rx = decode(u32(t.R + 144)), ry = decode(u32(t.R + 164))
     if (!Number.isFinite(rx) || !Number.isFinite(ry)) return
     t.ox = rx; t.oy = ry; t.dist = Math.hypot(rx, ry)
-    t.vx = f32(t.R + 132); t.vy = f32(t.R + 172)
   }
 
   // ---- one tick ----
@@ -172,6 +219,15 @@
     bot._ticks++
     if (!bot.on || !ready()) return
     gates()
+
+    // dead? stop everything and try to respawn every ~2s (camera gen == 6875 => no tank)
+    if (selfDead()) {
+      stopMove(); fire(false)
+      bot._deadTicks = (bot._deadTicks || 0) + 1
+      if (bot._deadTicks % 60 === 1) bot.spawn()
+      return
+    }
+    bot._deadTicks = 0
 
     if ((bot._frame++ & 3) === 0) {
       const es = entities()
@@ -181,8 +237,8 @@
     const t = bot._target
     if (!t) { stopMove(); fire(false); return }
 
-    const cv = document.querySelector('canvas')
-    const cw = cv ? cv.width : window.innerWidth, ch = cv ? cv.height : window.innerHeight
+    let cw = i32(602700), ch = i32(602704)             // canvas device px (verified globals)
+    if (!(cw > 0 && ch > 0)) { const cv = document.querySelector('canvas'); cw = cv ? cv.width : window.innerWidth; ch = cv ? cv.height : window.innerHeight }
     const z = zoom() * bot.AIM_SCALE
     const d = t.dist || 1, ux = t.ox / d, uy = t.oy / d
     const fleeing = selfHealth() < bot.retreatHP
@@ -194,9 +250,7 @@
         fire(true)
         moveVec(-ux, -uy)
       } else {
-        let ax = t.ox, ay = t.oy
-        if (bot.LEAD) { ax += t.vx * bot.leadFactor; ay += t.vy * bot.leadFactor }
-        aimPx(cw / 2 + ax * z, ch / 2 + ay * z)        // aim AT the player = thrust INTO the ram
+        aimPx(cw / 2 + t.ox * z, ch / 2 + t.oy * z)   // aim AT the player = thrust INTO the ram
         fire(bot.FIRE)
         moveVec(ux, uy)                                // full chase, no keep-distance
       }
@@ -225,10 +279,11 @@
     if (!r) { s.problem = 'wasm exports not captured — diep-mem-reader installed? Sandbox Mode=Raw? Reload.'; console.table(s); return s }
     const es = entities(); const self = findSelf(es); const t = pickTarget(es, self)
     Object.assign(s, {
-      entities: es.length, players: es.filter(e => e.isPlayer).length,
+      base: BASE, baseSrc: BASE_SRC, dead: selfDead(),
+      entities: es.length, named: es.filter(e => e.named).length,
       camera: [+camX().toFixed(0), +camY().toFixed(0)], zoom: +zoom().toFixed(3),
       textGate_560772: i32(G_TEXT), selfFound: !!self, selfHealth: +selfHealth().toFixed(2),
-      target: t ? { dist: +t.dist.toFixed(0), off: [+t.ox.toFixed(0), +t.oy.toFixed(0)], isPlayer: t.isPlayer } : null,
+      target: t ? { dist: +t.dist.toFixed(0), off: [+t.ox.toFixed(0), +t.oy.toFixed(0)], named: t.named } : null,
       decodeSelfCheck: decode(749705847) === 0,
     })
     console.table(s); return s

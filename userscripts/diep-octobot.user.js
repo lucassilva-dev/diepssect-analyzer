@@ -6,7 +6,7 @@
 //              'fallen' (Booster rammer that hunts the player) and 'octo' (orbit turret).
 //              For private Sandbox use only. SELF-CONTAINED (captures WASM itself; the separate
 //              diep-mem-reader is optional).
-// @version      0.8
+// @version      0.9
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -101,7 +101,7 @@
     _dv4: new DataView(new ArrayBuffer(4)),
     _strafeDir: 1, _strafeT: 0, _frame: 0, _target: null, _self: null,
     _ticks: 0, _rate: 0, _warnedSlow: 0, _deadTicks: 0,
-    _entCount: 0, _namedCount: 0,
+    _entCount: 0, _tankCount: 0,
   }
   W.diepBot = bot
 
@@ -181,6 +181,17 @@
     if (best) { BASE = best; BASE_SRC = (best === STATIC_BASE ? 'static' : 'registry') }
     return bestN
   }
+  // owner test (CONFIRMED, funcs 151/161/224): relations component @node+124 holds the spawner's
+  // id-tuple at +8..+18 with validity byte @+20; null tuple = (24603,_,6875,_,30379). An entity
+  // WITH a valid non-null owner is a projectile/drone/trap (never a target for the rammer). A tank
+  // or a shape has NO owner. So: tank = named && !owned ; projectile = owned.
+  const NULL_W = 24603, NULL_G = 6875, NULL_I = 30379
+  function isOwned(node) {
+    const rel = u32(node + 124); if (!ok(rel)) return false
+    if (!u8(rel + 20)) return false
+    if (u16(rel + 8) === NULL_W && u16(rel + 12) === NULL_G && u16(rel + 16) === NULL_I) return false
+    return true
+  }
   function entities() {
     const out = []
     if (!BASE && !findBase()) return out
@@ -191,9 +202,11 @@
       const R = u32(node + 172); if (!ok(R)) continue
       const rx = decode(u32(R + 144)), ry = decode(u32(R + 164))
       if (!Number.isFinite(rx) || !Number.isFinite(ry)) continue
+      const named = ok(u32(node + 168)), owned = isOwned(node)
       out.push({
         node, R, ox: rx, oy: ry, dist: Math.hypot(rx, ry),
-        named: ok(u32(node + 168)),   // server-sent nametag => player tank (or a named AI boss)
+        named, owned,
+        tank: named && !owned,   // real tank (player or named AI); excludes projectiles/shapes
       })
     }
     if (!out.length) { if (++_dryScans >= 15) { _dryScans = 0; findBase() } } else _dryScans = 0
@@ -225,10 +238,11 @@
     const r = f32(H + 48); return Number.isFinite(r) ? Math.max(0, Math.min(1, r)) : 1
   }
   function pickTarget(es, self) {
-    const cands = es.filter(e => e !== self && e.dist > 40)
+    // never target projectiles/drones (owned); never target self
+    const cands = es.filter(e => e !== self && e.dist > 40 && !e.owned)
     if (!cands.length) return null
-    const players = cands.filter(e => e.named)
-    const pool = (bot.PREFER_PLAYERS && players.length) ? players : cands
+    const tanks = cands.filter(e => e.tank)   // real enemy tanks (you, in a 1v1)
+    const pool = (bot.PREFER_PLAYERS && tanks.length) ? tanks : cands
     pool.sort((a, b) => a.dist - b.dist)
     return pool[0]
   }
@@ -257,7 +271,7 @@
     if ((bot._frame++ & 3) === 0) {
       const es = entities()
       bot._entCount = es.length
-      bot._namedCount = es.filter(e => e.named).length
+      bot._tankCount = es.filter(e => e.tank).length
       bot._self = findSelf(es)
       bot._target = pickTarget(es, bot._self)
     } else refresh(bot._target)
@@ -307,10 +321,10 @@
     const es = entities(); const self = findSelf(es); const t = pickTarget(es, self)
     Object.assign(s, {
       base: BASE, baseSrc: BASE_SRC, dead: selfDead(),
-      entities: es.length, named: es.filter(e => e.named).length,
+      entities: es.length, tanks: es.filter(e => e.tank).length,
       camera: [+camX().toFixed(0), +camY().toFixed(0)], zoom: +zoom().toFixed(3),
       textGate_560772: i32(G_TEXT), selfFound: !!self, selfHealth: +selfHealth().toFixed(2),
-      target: t ? { dist: +t.dist.toFixed(0), off: [+t.ox.toFixed(0), +t.oy.toFixed(0)], named: t.named } : null,
+      target: t ? { dist: +t.dist.toFixed(0), off: [+t.ox.toFixed(0), +t.oy.toFixed(0)], tank: t.tank } : null,
       decodeSelfCheck: decode(749705847) === 0,
     })
     console.table(s); return s
@@ -475,16 +489,16 @@
     if (!bot.on) {
       const es = entities()
       bot._entCount = es.length
-      bot._namedCount = es.filter(e => e.named).length
+      bot._tankCount = es.filter(e => e.tank).length
       bot._self = findSelf(es)
       bot._target = pickTarget(es, bot._self)
     }
     setRow(UI.rows.base, BASE ? BASE + ' (' + BASE_SRC + ')' : 'não achada', BASE ? '#6f6' : '#f66')
-    setRow(UI.rows.ents, bot._entCount + ' (' + bot._namedCount + ' c/ nome)', bot._entCount ? '#6f6' : '#f66')
+    setRow(UI.rows.ents, bot._entCount + ' · ' + (bot._tankCount || 0) + ' tanque(s)', bot._entCount ? '#6f6' : '#f66')
     const dead = selfDead()
     setRow(UI.rows.self, dead ? 'MORTO' : (bot._self ? 'vivo · HP ' + Math.round(selfHealth() * 100) + '%' : '—'), dead ? '#f66' : '#6f6')
     const t = bot._target
-    setRow(UI.rows.tgt, t ? Math.round(t.dist) + 'u ' + (t.named ? '(tanque!)' : '(shape)') : 'nenhum', t ? (t.named ? '#f6f' : '#fd6') : '#888')
+    setRow(UI.rows.tgt, t ? Math.round(t.dist) + 'u ' + (t.tank ? '(tanque!)' : '(shape)') : 'nenhum', t ? (t.tank ? '#f6f' : '#fd6') : '#888')
     setRow(UI.rows.loop, bot._rate + ' t/s', bot._rate >= 15 ? '#6f6' : '#fa0')
     setRow(UI.rows.st, (bot.on ? 'CAÇANDO' : 'parado') + ' · ' + bot.MODE, bot.on ? '#f0f' : '#aaa')
   }
@@ -515,5 +529,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.8] loaded — captura própria + painel na tela.', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.9] loaded — alvo por dono (tanque real) + captura própria + painel.', 'color:#f0f;font-weight:bold')
 })()

@@ -6,7 +6,7 @@
 //              level-1->45 duel: auto-spawn, auto-allocate stats to the build, auto-evolve the
 //              tank tree. Modes: 'fallen' (Booster rammer) and 'overlord' (drone turret).
 //              For private Sandbox use only. SELF-CONTAINED (captures WASM itself).
-// @version      0.11
+// @version      0.12
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -80,7 +80,7 @@
     } catch (e) {}
   })()
 
-  const VERSION = '0.11'
+  const VERSION = '0.12'
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
   // stat keys '1'..'8' = keyCodes 49..56. diep stat order:
@@ -126,7 +126,7 @@
     _strafeDir: 1, _strafeT: 0, _frame: 0, _target: null, _self: null,
     _ticks: 0, _rate: 0, _warnedSlow: 0, _deadTicks: 0,
     _entCount: 0, _tankCount: 0,
-    _allocSeq: [], _allocI: 0, _evoStage: 0, _evoWasUp: false,
+    _allocSeq: [], _allocI: 0, _evoStage: 0, _evoWasUp: false, _tdist: 0,
   }
   W.diepBot = bot
 
@@ -186,28 +186,31 @@
   // sitting at camera-relative origin. ONLY the currently-active arena container has the local tank
   // at ~(0,0); stale/old containers linger in memory full of garbage but have no near-origin tank.
   // Picking by node count alone chose a wrong container (47 fake "tanks", phantom target @2490u).
+  // Scan a candidate container and try to locate SELF by the camera-followed id. The container's
+  // camera object is the 1st element of the vector @b+676; its id-tuple is (u16 cam+68 gen,
+  // u16 cam+72 idx). SELF = the live node whose id (node+116/+120) matches AND is alive (hp>0).
+  // This is garbage-proof: earlier we matched "a valid-health node near origin", but entities are
+  // NOT camera-relative here (self is not at 0,0) and dead junk decodes to (0,0) with hp 0, which
+  // fooled it. The camera-id match is exact.
   function scanBase(b) {
-    if (!ok(b + 7196)) return { n: 0, self: false }
-    let n = 0, self = false
+    if (!ok(b + 7196)) return { n: 0, selfNode: 0 }
+    let cg = -1, ci = -1
+    const beg = u32(b + 676)
+    if (ok(beg) && beg !== u32(b + 680)) { const cam = u32(beg); if (ok(cam)) { cg = u16(cam + 68); ci = u16(cam + 72) } }
+    let n = 0, selfNode = 0
     try {
       for (let pr = 0; pr < 16384; pr++) {
         if (!((u8(b + 796 + (pr >> 3)) >> (pr & 7)) & 1)) continue
         const pg = u32(b + 6940 + ((pr >> 8) << 2)); if (!ok(pg)) continue
         const nd = (pg + (pr & 255) * 224) >>> 0; if (!liveNode(nd)) continue
         n++
-        if (!self) {
-          const R = u32(nd + 172)
-          if (ok(R)) {
-            const ox = decode(u32(R + 144)), oy = decode(u32(R + 164))
-            if (Number.isFinite(ox) && Math.abs(ox) < 120 && Math.abs(oy) < 120) {
-              const H = u32(nd + 176)
-              if (ok(H)) { const r = f32(H + 48); if (r >= -0.02 && r <= 1.02) self = true }
-            }
-          }
+        if (!selfNode && cg >= 0 && cg !== 6875 && u16(nd + 116) === cg && u16(nd + 120) === ci) {
+          const H = u32(nd + 176), R = u32(nd + 172)
+          if (ok(R) && ok(H)) { const r = f32(H + 48); if (r > 0.01 && r <= 1.02) selfNode = nd }
         }
       }
     } catch (e) {}
-    return { n, self }
+    return { n, selfNode }
   }
   function regCandidates() {
     const seen = new Set([STATIC_BASE]), cands = []
@@ -219,15 +222,15 @@
     return cands
   }
   function findBase() {
-    // 1) static container holding self -> authoritative
+    // 1) static container whose camera-id resolves to a live self -> authoritative
     const st = scanBase(STATIC_BASE)
-    if (st.self) { BASE = STATIC_BASE; BASE_SRC = 'static+self'; return st.n }
-    // 2) registry container holding self -> pick the richest such
+    if (st.selfNode) { BASE = STATIC_BASE; BASE_SRC = 'static+self'; return st.n }
+    // 2) registry container whose camera-id resolves to a live self -> richest such
     const cands = regCandidates()
     let best = 0, bestN = 0
-    for (const b of cands) { const r = scanBase(b); if (r.self && r.n > bestN) { bestN = r.n; best = b } }
+    for (const b of cands) { const r = scanBase(b); if (r.selfNode && r.n > bestN) { bestN = r.n; best = b } }
     if (best) { BASE = best; BASE_SRC = 'registry+self'; return bestN }
-    // 3) no self found anywhere (dead/loading) -> fall back to the richest container
+    // 3) no self match anywhere (dead/loading) -> fall back to the richest container
     let fb = STATIC_BASE, fbn = st.n
     for (const b of cands) { const r = scanBase(b); if (r.n > fbn) { fbn = r.n; fb = b } }
     BASE = fb; BASE_SRC = (fb === STATIC_BASE ? 'static?' : 'registry?')
@@ -257,8 +260,10 @@
       const H = u32(node + 176)
       let hp = NaN; if (ok(H)) { const r = f32(H + 48); if (Number.isFinite(r)) hp = Math.max(0, Math.min(1, r)) }
       const named = ok(u32(node + 168)), owned = isOwned(node)
+      // ox,oy are raw decoded render coords (NOT camera-relative here). Distances/aim are computed
+      // RELATIVE TO SELF at use-time, so the absolute frame doesn't matter.
       out.push({
-        node, R, ox: rx, oy: ry, dist: Math.hypot(rx, ry), hp,
+        node, R, ox: rx, oy: ry, hp, _d: 0,
         named, owned,
         tank: named && !owned && hp > 0,   // real live tank; excludes projectiles/shapes/garbage
       })
@@ -279,10 +284,11 @@
     const c = cameraObj()
     if (c) {
       const g = u16(c + 68), k = u16(c + 72)
-      for (const e of es) if (u16(e.node + 116) === g && u16(e.node + 120) === k) return e
+      if (g !== 6875) for (const e of es) if (u16(e.node + 116) === g && u16(e.node + 120) === k) return e
     }
+    // fallback: the highest-health real tank (self is alive; avoids the hp-0 garbage at origin)
     let best = null
-    for (const e of es) if (e.dist < 60 && (!best || e.dist < best.dist)) best = e
+    for (const e of es) if (e.tank && (!best || e.hp > best.hp)) best = e
     return best
   }
 
@@ -323,21 +329,22 @@
   // diepBot.evoX / evoY0 / evoDY until the panel closes (upgrade taken).
   bot.evoTest = function (n) { uiLog('evoTest slot ' + (n | 0) + ' @(' + Math.round(bot.evoX) + ',' + Math.round(bot.evoY0 + (n | 0) * bot.evoDY) + ')', '#9ad'); clickUpgradeIcon(n | 0) }
   function pickTarget(es, self) {
-    // never target projectiles/drones (owned); never target self
-    const cands = es.filter(e => e !== self && e.dist > 40 && !e.owned)
-    if (!cands.length) return null
-    // hunt the nearest enemy tank if it's within aggro range; otherwise farm the nearest shape
-    // (so the bot levels 1->45 instead of chasing you across the map and never growing).
-    const tanks = cands.filter(e => e.tank && e.dist < bot.aggroRange)
-    const pool = (bot.PREFER_PLAYERS && tanks.length) ? tanks : cands
-    pool.sort((a, b) => a.dist - b.dist)
+    if (!self) return null
+    const sx = self.ox, sy = self.oy
+    const cands = es.filter(e => e !== self && !e.owned)
+    for (const e of cands) e._d = Math.hypot(e.ox - sx, e.oy - sy)   // distance FROM SELF
+    const near = cands.filter(e => e._d > 30)
+    if (!near.length) return null
+    // hunt the nearest enemy tank within aggro range; else farm the nearest shape (to level 1->45)
+    const tanks = near.filter(e => e.tank && e._d < bot.aggroRange)
+    const pool = (bot.PREFER_PLAYERS && tanks.length) ? tanks : near
+    pool.sort((a, b) => a._d - b._d)
     return pool[0]
   }
   function refresh(t) {
     if (!t || !ok(t.R)) return
     const rx = decode(u32(t.R + 144)), ry = decode(u32(t.R + 164))
-    if (!Number.isFinite(rx) || !Number.isFinite(ry)) return
-    t.ox = rx; t.oy = ry; t.dist = Math.hypot(rx, ry)
+    if (Number.isFinite(rx) && Number.isFinite(ry)) { t.ox = rx; t.oy = ry }
   }
 
   // ---- one tick ----
@@ -364,38 +371,41 @@
       bot._tankCount = es.filter(e => e.tank).length
       bot._self = findSelf(es)
       bot._target = pickTarget(es, bot._self)
-    } else refresh(bot._target)
-    const t = bot._target
-    if (!t) { stopMove(); fire(false); return }
+    } else { refresh(bot._self); refresh(bot._target) }
+    const self = bot._self, t = bot._target
+    if (!self || !t) { stopMove(); fire(false); return }
 
     let cw = i32(602700), ch = i32(602704)             // canvas device px (verified globals)
     if (!(cw > 0 && ch > 0)) { const cv = document.querySelector('canvas'); cw = cv ? cv.width : window.innerWidth; ch = cv ? cv.height : window.innerHeight }
     const z = zoom() * bot.AIM_SCALE
-    const d = t.dist || 1, ux = t.ox / d, uy = t.oy / d
+    // target offset FROM SELF (world units) — camera follows self, so screen px = center + off*zoom
+    const rx = t.ox - self.ox, ry = t.oy - self.oy
+    const dist = Math.hypot(rx, ry) || 1, ux = rx / dist, uy = ry / dist
+    bot._tdist = dist
     const fleeing = selfHealth() < bot.retreatHP
 
     if (bot.MODE === 'fallen') {
       // Fallen Booster: ram the target. Firing = rear-barrel recoil thrust toward the mouse.
       if (fleeing) {
-        aimPx(cw / 2 - t.ox * z, ch / 2 - t.oy * z)   // aim AWAY -> thrust boosts the escape
+        aimPx(cw / 2 - rx * z, ch / 2 - ry * z)       // aim AWAY -> thrust boosts the escape
         fire(true)
         moveVec(-ux, -uy)
       } else {
-        aimPx(cw / 2 + t.ox * z, ch / 2 + t.oy * z)   // aim AT the target = thrust INTO the ram
+        aimPx(cw / 2 + rx * z, ch / 2 + ry * z)       // aim AT the target = thrust INTO the ram
         fire(bot.FIRE)
         moveVec(ux, uy)
       }
       return
     }
 
-    // octo: orbiting turret
-    aimPx(cw / 2 + t.ox * z, ch / 2 + t.oy * z)
-    fire(bot.FIRE && t.dist < bot.farmFire)
+    // overlord / turret: aim + fire, orbit at range
+    aimPx(cw / 2 + rx * z, ch / 2 + ry * z)
+    fire(bot.FIRE && dist < bot.farmFire)
     let mx = 0, my = 0
     if (fleeing) { mx = -ux; my = -uy }
     else {
-      if (d > bot.keepDist) { mx += ux; my += uy }
-      else if (d < bot.tooClose) { mx -= ux; my -= uy }
+      if (dist > bot.keepDist) { mx += ux; my += uy }
+      else if (dist < bot.tooClose) { mx -= ux; my -= uy }
       if (++bot._strafeT > bot.strafeFlip) { bot._strafeT = 0; bot._strafeDir *= -1 }
       mx += -uy * bot.strafeGain * bot._strafeDir
       my += ux * bot.strafeGain * bot._strafeDir
@@ -414,7 +424,7 @@
       entities: es.length, tanks: es.filter(e => e.tank).length,
       camera: [+camX().toFixed(0), +camY().toFixed(0)], zoom: +zoom().toFixed(3),
       textGate_560772: i32(G_TEXT), selfFound: !!self, selfHealth: +selfHealth().toFixed(2),
-      target: t ? { dist: +t.dist.toFixed(0), off: [+t.ox.toFixed(0), +t.oy.toFixed(0)], tank: t.tank } : null,
+      target: t ? { dist: Math.round(t._d), tank: t.tank } : null,
       decodeSelfCheck: decode(749705847) === 0,
     })
     console.table(s); return s
@@ -440,12 +450,14 @@
     console.log('%c[diag] containers candidatos (self=contém você):', 'color:#0ff'); console.table(rows)
     findBase()
     console.log('[diag] USANDO base', BASE, BASE_SRC)
-    const es = entities()
-    console.table(es.slice().sort((a, c) => a.dist - c.dist).slice(0, 15).map(e => ({
-      dist: Math.round(e.dist), tank: e.tank, named: e.named, owned: e.owned,
+    const es = entities(); const self = findSelf(es)
+    const sx = self ? self.ox : 0, sy = self ? self.oy : 0
+    console.log('[diag] self node=', self ? self.node : null, 'hp=', self ? +self.hp.toFixed(2) : null, 'pos=(' + Math.round(sx) + ',' + Math.round(sy) + ')')
+    console.table(es.map(e => ({ ...e, d: Math.hypot(e.ox - sx, e.oy - sy) })).sort((a, c) => a.d - c.d).slice(0, 15).map(e => ({
+      distFromSelf: Math.round(e.d), tank: e.tank, named: e.named, owned: e.owned,
       hp: +(e.hp || 0).toFixed(2), ox: Math.round(e.ox), oy: Math.round(e.oy),
     })))
-    uiLog('diag no console (F12): ' + rows.length + ' containers, base ' + BASE_SRC, '#9ad')
+    uiLog('diag no console (F12): ' + rows.length + ' containers, self ' + (self ? 'OK' : 'NÃO ACHADO'), '#9ad')
   }
 
   // ---- loadout helpers (Sandbox menu/cheats are DOM) ----
@@ -609,7 +621,7 @@
     const dead = selfDead()
     setRow(UI.rows.self, dead ? 'MORTO' : (bot._self ? 'vivo · HP ' + Math.round(selfHealth() * 100) + '%' : '—'), dead ? '#f66' : '#6f6')
     const t = bot._target
-    setRow(UI.rows.tgt, t ? Math.round(t.dist) + 'u ' + (t.tank ? '(tanque!)' : '(shape)') : 'nenhum', t ? (t.tank ? '#f6f' : '#fd6') : '#888')
+    setRow(UI.rows.tgt, t ? Math.round(bot.on ? (bot._tdist || t._d) : t._d) + 'u ' + (t.tank ? '(tanque!)' : '(shape)') : 'nenhum', t ? (t.tank ? '#f6f' : '#fd6') : '#888')
     const up = upgradeUp()
     setRow(UI.rows.evo, up ? '⚡ UPGRADE DISPONÍVEL' : 'etapa ' + bot._evoStage + '/3', up ? '#ff5' : '#8fb')
     setRow(UI.rows.loop, bot._rate + ' t/s', bot._rate >= 15 ? '#6f6' : '#fa0')
@@ -644,5 +656,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.11] loaded — 1→45 auto-play + auto-evolve (calibrável)', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.12] loaded — coords relativas a SELF (corrige mira/movimento) + auto-evolve', 'color:#f0f;font-weight:bold')
 })()

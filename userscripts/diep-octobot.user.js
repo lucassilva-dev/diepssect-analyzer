@@ -2,11 +2,11 @@
 // @name         Diep OctoBot (aggressive sandbox bot)
 // @description  Autonomous aggressive bot for diep.io SANDBOX duels with an on-screen control
 //              panel (no console needed). Reads every entity from WASM memory and DRIVES the
-//              tank (aim / move / fire) through the game's own WASM input exports. Modes:
-//              'fallen' (Booster rammer that hunts the player) and 'octo' (orbit turret).
-//              For private Sandbox use only. SELF-CONTAINED (captures WASM itself; the separate
-//              diep-mem-reader is optional).
-// @version      0.10
+//              tank (aim / move / fire) through the game's own WASM input exports. Plays a full
+//              level-1->45 duel: auto-spawn, auto-allocate stats to the build, auto-evolve the
+//              tank tree. Modes: 'fallen' (Booster rammer) and 'overlord' (drone turret).
+//              For private Sandbox use only. SELF-CONTAINED (captures WASM itself).
+// @version      0.11
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -19,14 +19,16 @@
  * diep's bundle. If the panel shows "memória: NÃO capturada", that's the fix; then reload (F5).
  *
  * UI: a draggable panel appears top-right on diep.io. Buttons:
- *   ▶ FALLEN  — turnkey Booster rammer duel bot (spawn -> max level -> ram build -> ON)
- *   ▶ OCTO    — turnkey orbit-turret bot
- *   ⚔ ON/OFF  — toggle the brain (same as pressing B)
- *   🧪 mover  — movement self-test (drives right 0.8s, reports dx/dy)
- *   📡 base   — re-scan the entity-store base (arena switch)
- * The status rows (memória/base/entidades/eu/alvo/loop) update live; the log shows what the
- * bot is doing. Click the tank tree yourself when asked (fallen: Flank Guard -> Tri-Angle ->
- * Booster; octo: Twin -> Quad Tank -> Octo Tank).
+ *   ▶ FALLEN   — Play at level 1 + Booster build + auto-evolve + ON (rammer)
+ *   ▶ OVERLORD — Play at level 1 + Overlord build + auto-evolve + ON (drones)
+ *   ⚔ ON/OFF   — toggle the brain (same as pressing B)
+ *   🧪 mover   — movement self-test (drives right 0.8s, reports dx/dy)
+ *   📡 base    — re-scan the entity-store base (arena switch)
+ *   🔍 diag    — dump candidate containers + nearest entities to the console
+ * The status rows update live; the log shows what the bot is doing.
+ * Builds (stat order 1..8 = Regen/MaxHP/BodyDmg/BulletSpd/Pen/BulletDmg/Reload/MoveSpd):
+ *   fallen(Booster): 7 MoveSpd, 7 BulletDmg, 7 Pen, 7 Reload, rest BulletSpd
+ *   overlord:        7 Reload, 7 BulletDmg, 7 Pen, 7 BulletSpd, rest MoveSpd
  *
  * DUEL SETUP: two windows on the same party link, SIDE BY SIDE (both visible).
  *   Window A (you): play normally, leave the bot OFF.
@@ -78,31 +80,53 @@
     } catch (e) {}
   })()
 
-  const VERSION = '0.10'
+  const VERSION = '0.11'
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
-  // stat keys '1'..'8' = 49..56. Build orders (priority-first; 8 presses each):
+  // stat keys '1'..'8' = keyCodes 49..56. diep stat order:
+  //   1 Regen(49) 2 MaxHP(50) 3 BodyDmg(51) 4 BulletSpd(52) 5 Penetration(53) 6 BulletDmg(54)
+  //   7 Reload(55) 8 MoveSpd(56).  Priority-first: fill each to 7 in order, remainder to the last.
   const BUILDS = {
-    fallen: [51, 50, 56, 49, 55],  // 3 Body Dmg, 2 Max HP, 8 Move Spd, 1 Regen, 7 Reload
-    octo:   [54, 55, 53, 52, 56],  // 6 Bullet Dmg, 7 Reload, 5 Pen, 4 Bullet Spd, 8 Move Spd
+    // Booster ("fallen"): 7 MoveSpd, 7 BulletDmg, 7 Penetration, 7 Reload, rest BulletSpd
+    fallen:   [56, 54, 53, 55, 52],
+    // Overlord: 7 Reload, 7 BulletDmg, 7 Penetration, 7 BulletSpd, rest MoveSpd
+    overlord: [55, 54, 53, 52, 56],
   }
+  const TREE = {
+    fallen:   'Flank Guard → Tri-Angle → BOOSTER',
+    overlord: 'Sniper → Overseer → OVERLORD',
+  }
+  // Auto-evolve (RE-verified: class tree bundle line 29; upgrade-available flag u8@621205 =
+  // isShowingTankUpgrades mirror; NO keycode/export selects tanks -> it's a canvas mouse click
+  // hit-tested by WASM at the mouse pos). Icon column is top-left; slot = which icon to click each
+  // tier. fallen: Tank->FlankGuard(slot3)->TriAngle(slot0)->Booster(slot0). overlord:
+  // Tank->Sniper(slot1)->Overseer(slot1)->Overlord(slot0).
+  const EVO_SLOTS = { fallen: [3, 0, 0], overlord: [1, 1, 0] }
+  const UP_FLAG = 621205
 
   const bot = {
     on: false,
-    MODE: 'fallen',        // 'fallen' (rammer, hunts the player) | 'octo' (orbit turret)
+    MODE: 'fallen',        // 'fallen' (Booster rammer) | 'overlord' (drone orbit turret)
     FIRE: true,
-    PREFER_PLAYERS: true,  // lock onto named actors first (players/bosses: u32[node+168]!=0)
+    PREFER_PLAYERS: true,  // hunt the enemy tank when within aggroRange, else farm shapes to level
+    aggroRange: 1600,      // hunt the player within this (world units); beyond it, farm to grow
     keepDist: 230, tooClose: 130, farmFire: 900,
     retreatHP: 0.20,
     strafeGain: 0.85, strafeFlip: 55,
     deadzone: 0.10,
     AIM_ZOOM: true, AIM_SCALE: 1.0,
+    AUTO_STATS: true,      // continuously spend stat points in the build order as levels arrive
+    AUTO_EVOLVE: true,     // auto-take tank upgrades toward the target tank (Booster/Overlord)
+    // upgrade-icon calibration (CSS px from top-left; ×dpr applied internally). Tune live if the
+    // bot detects "UPGRADE DISPONÍVEL" but doesn't evolve.
+    evoX: 40, evoY0: 120, evoDY: 78, evoClickMs: 90,
     // internals
     _held: { up: false, down: false, left: false, right: false },
     _dv4: new DataView(new ArrayBuffer(4)),
     _strafeDir: 1, _strafeT: 0, _frame: 0, _target: null, _self: null,
     _ticks: 0, _rate: 0, _warnedSlow: 0, _deadTicks: 0,
     _entCount: 0, _tankCount: 0,
+    _allocSeq: [], _allocI: 0, _evoStage: 0, _evoWasUp: false,
   }
   W.diepBot = bot
 
@@ -267,11 +291,44 @@
     const H = u32(s.node + 176); if (!ok(H)) return 1
     const r = f32(H + 48); return Number.isFinite(r) ? Math.max(0, Math.min(1, r)) : 1
   }
+
+  // ---- auto-evolve: click the tank-upgrade icon toward the target tank ----
+  const upgradeUp = () => { try { return u8(UP_FLAG) !== 0 } catch (e) { return false } }
+  function clickUpgradeIcon(n) {
+    const d = (window.devicePixelRatio || 1)
+    const px = Math.round(bot.evoX * d), py = Math.round((bot.evoY0 + n * bot.evoDY) * d)
+    aimPx(px, py)                                  // va: move the cursor onto icon N (device px)
+    // selection is a canvas click hit-tested by WASM. Drive it two safe ways (never touch the
+    // 561232/561233 control-scheme cache): a real DOM mouse event on the canvas + an autofire pulse.
+    try {
+      const cv = document.querySelector('canvas')
+      if (cv) { const cx = px / d, cy = py / d
+        for (const type of ['mousemove', 'mousedown', 'mouseup'])
+          cv.dispatchEvent(new MouseEvent(type, { clientX: cx, clientY: cy, button: 0, buttons: type === 'mouseup' ? 0 : 1, bubbles: true })) }
+    } catch (e) {}
+    try { setU8(FIRE_BYTE, 1); setTimeout(() => { try { setU8(FIRE_BYTE, 0) } catch (e) {} }, bot.evoClickMs) } catch (e) {}
+  }
+  function evolveTick() {
+    if (!bot.AUTO_EVOLVE || !bot.on || !ready() || selfDead()) return
+    const up = upgradeUp()
+    if (up && bot._evoStage < 3) {
+      if (i32(G_TEXT) !== 0) setI32(G_TEXT, 0)         // keep movement gate open (panel doesn't block it)
+      const slots = EVO_SLOTS[bot.MODE] || EVO_SLOTS.fallen
+      clickUpgradeIcon(slots[bot._evoStage] | 0)
+    }
+    if (bot._evoWasUp && !up) { bot._evoStage++; uiLog('evoluiu! etapa ' + bot._evoStage + '/3', '#6f6') }
+    bot._evoWasUp = up
+  }
+  // live calibration: when the upgrade panel is up, diepBot.evoTest(slot) clicks that icon; tune
+  // diepBot.evoX / evoY0 / evoDY until the panel closes (upgrade taken).
+  bot.evoTest = function (n) { uiLog('evoTest slot ' + (n | 0) + ' @(' + Math.round(bot.evoX) + ',' + Math.round(bot.evoY0 + (n | 0) * bot.evoDY) + ')', '#9ad'); clickUpgradeIcon(n | 0) }
   function pickTarget(es, self) {
     // never target projectiles/drones (owned); never target self
     const cands = es.filter(e => e !== self && e.dist > 40 && !e.owned)
     if (!cands.length) return null
-    const tanks = cands.filter(e => e.tank)   // real enemy tanks (you, in a 1v1)
+    // hunt the nearest enemy tank if it's within aggro range; otherwise farm the nearest shape
+    // (so the bot levels 1->45 instead of chasing you across the map and never growing).
+    const tanks = cands.filter(e => e.tank && e.dist < bot.aggroRange)
     const pool = (bot.PREFER_PLAYERS && tanks.length) ? tanks : cands
     pool.sort((a, b) => a.dist - b.dist)
     return pool[0]
@@ -297,6 +354,9 @@
       return
     }
     bot._deadTicks = 0
+
+    // upgrade panel up? pause combat so auto-evolve (separate loop) can click the icon cleanly
+    if (upgradeUp()) { stopMove(); return }
 
     if ((bot._frame++ & 3) === 0) {
       const es = entities()
@@ -399,28 +459,32 @@
     return false
   }
   bot.spawn = function () { if (!clickByText('^Play')) uiLog('botão Play não achado — clique Play', '#fa0') }
-  bot.maxStats = function (order) {
-    order = order || BUILDS[bot.MODE] || BUILDS.octo
-    const q = []; for (const k of order) for (let i = 0; i < 8; i++) q.push(k)
-    const id = setInterval(() => {
-      const k = q.shift(); if (k == null) return clearInterval(id)
-      try { E().ua(k, 1); E().ua(k, 0) } catch (e) {}
-    }, 60)
+  // continuous stat allocation: build a priority sequence (each stat 7x, in order) and press one
+  // key per allocTick; the game gives 1 point per level so points fill in priority as they arrive.
+  function setBuild(order) {
+    order = order || BUILDS[bot.MODE] || BUILDS.fallen
+    const seq = []; for (const k of order) for (let i = 0; i < 7; i++) seq.push(k)
+    bot._allocSeq = seq; bot._allocI = 0
   }
-  bot.maxLevel = function () {
+  function allocTick() {
+    if (!bot.AUTO_STATS || !bot._allocSeq.length || !ready() || selfDead()) return
+    const k = bot._allocSeq[bot._allocI % bot._allocSeq.length]; bot._allocI++
+    try { E().ua(k, 1); E().ua(k, 0) } catch (e) {}
+  }
+  bot.maxStats = function (order) { setBuild(order) }   // (re)sets the build; the alloc loop spends
+  bot.maxLevel = function () {   // sandbox cheat (optional; NOT used in a 1->45 duel)
     if (!clickByText('Max Level')) { clickByText('Sandbox|Cheat'); setTimeout(() => { if (!clickByText('Max Level')) uiLog('Max Level não achado — abra o frasco e clique', '#fa0') }, 200) }
   }
   bot.start = async function (mode) {
     if (mode) bot.MODE = mode
     if (!ready()) { uiLog('mem não capturada — recarregue (F5) e tente de novo', '#f66'); return }
-    uiLog('start ' + bot.MODE + ': spawn…')
-    bot.spawn(); await sleep(1300)
-    bot.maxLevel(); await sleep(900)
-    bot.maxStats(); await sleep(400)
-    const tree = bot.MODE === 'fallen' ? 'Flank Guard → Tri-Angle → BOOSTER' : 'Twin → Quad → OCTO TANK'
-    uiLog('CLIQUE a árvore: ' + tree, '#0ff')
+    uiLog('start ' + bot.MODE + ': Play (nível 1)…')
+    bot._evoStage = 0; bot._evoWasUp = false     // fresh evolution path
+    bot.spawn(); await sleep(1200)
+    setBuild()                                  // start continuous stat allocation for this build
+    uiLog('jogando 1→45: upa stats + evolui sozinho. Árvore: ' + TREE[bot.MODE], '#0ff')
     bot.moveTest('right')
-    setTimeout(() => { bot.on = true; uiLog('BOT ON — caçando (' + bot.MODE + ')', '#f0f') }, 6000)
+    setTimeout(() => { bot.on = true; uiLog('BOT ON — jogando (' + bot.MODE + ')', '#f0f') }, 2500)
   }
 
   // ================= UI PANEL (no console needed) =================
@@ -483,13 +547,14 @@
     UI.rows.ents = row('entidades')
     UI.rows.self = row('eu')
     UI.rows.tgt = row('alvo')
+    UI.rows.evo = row('evolução')
     UI.rows.loop = row('loop')
     UI.rows.st = row('estado')
 
     const btns1 = document.createElement('div'); btns1.style.cssText = 'display:flex;margin-top:5px'
     btns1.append(
-      mkBtn('▶ FALLEN', '#a1206e', () => bot.start('fallen'), 'spawn + max + build rammer + ON (clique a árvore até Booster)'),
-      mkBtn('▶ OCTO', '#20a16e', () => bot.start('octo'), 'spawn + max + build atirador + ON (árvore até Octo)'),
+      mkBtn('▶ FALLEN', '#a1206e', () => bot.start('fallen'), 'Play nível 1 + upa build Booster + evolui + ON (rammer)'),
+      mkBtn('▶ OVERLORD', '#20a16e', () => bot.start('overlord'), 'Play nível 1 + upa build Overlord + evolui + ON (drones)'),
     )
     const btns2 = document.createElement('div'); btns2.style.cssText = 'display:flex'
     btns2.append(
@@ -545,6 +610,8 @@
     setRow(UI.rows.self, dead ? 'MORTO' : (bot._self ? 'vivo · HP ' + Math.round(selfHealth() * 100) + '%' : '—'), dead ? '#f66' : '#6f6')
     const t = bot._target
     setRow(UI.rows.tgt, t ? Math.round(t.dist) + 'u ' + (t.tank ? '(tanque!)' : '(shape)') : 'nenhum', t ? (t.tank ? '#f6f' : '#fd6') : '#888')
+    const up = upgradeUp()
+    setRow(UI.rows.evo, up ? '⚡ UPGRADE DISPONÍVEL' : 'etapa ' + bot._evoStage + '/3', up ? '#ff5' : '#8fb')
     setRow(UI.rows.loop, bot._rate + ' t/s', bot._rate >= 15 ? '#6f6' : '#fa0')
     setRow(UI.rows.st, (bot.on ? 'CAÇANDO' : 'parado') + ' · ' + bot.MODE, bot.on ? '#f0f' : '#aaa')
   }
@@ -560,6 +627,8 @@
   } catch (e) { /* CSP — fall back to timers below */ }
   setInterval(tickGuard, 50)
   ;(function raf() { tickGuard(); requestAnimationFrame(raf) })()
+  setInterval(allocTick, 110)     // continuous stat allocation (spends points in build priority)
+  setInterval(evolveTick, 260)    // auto-evolve when a tank-upgrade panel is up
   setInterval(() => {
     bot._rate = Math.round(bot._ticks / 2); bot._ticks = 0
     if (bot.on && bot._rate < 15 && Date.now() - bot._warnedSlow > 10000) {
@@ -575,5 +644,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.10] loaded — base por self-na-origem + diag', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.11] loaded — 1→45 auto-play + auto-evolve (calibrável)', 'color:#f0f;font-weight:bold')
 })()

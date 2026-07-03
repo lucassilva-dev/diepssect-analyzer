@@ -4,8 +4,9 @@
 //              panel (no console needed). Reads every entity from WASM memory and DRIVES the
 //              tank (aim / move / fire) through the game's own WASM input exports. Modes:
 //              'fallen' (Booster rammer that hunts the player) and 'octo' (orbit turret).
-//              For private Sandbox use only. Requires diep-mem-reader.
-// @version      0.7
+//              For private Sandbox use only. SELF-CONTAINED (captures WASM itself; the separate
+//              diep-mem-reader is optional).
+// @version      0.8
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -13,7 +14,9 @@
 // ==/UserScript==
 
 /*
- * REQUIRES: diep-mem-reader.user.js installed (Tampermonkey Sandbox Mode = "Raw").
+ * SETUP: install THIS script only. Tampermonkey Sandbox Mode must be "Raw" (Settings -> config
+ * mode Advanced -> Sandbox Mode -> Raw) so the document-start WASM hook wins the race against
+ * diep's bundle. If the panel shows "memória: NÃO capturada", that's the fix; then reload (F5).
  *
  * UI: a draggable panel appears top-right on diep.io. Buttons:
  *   ▶ FALLEN  — turnkey Booster rammer duel bot (spawn -> max level -> ram build -> ON)
@@ -42,6 +45,38 @@
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window
   if (W.__octobotInstalled) return
   W.__octobotInstalled = true
+
+  // ---- self-contained WASM capture (no separate mem-reader needed) ----
+  // Hook WASM instantiation at document-start so we grab the game's linear memory + exports the
+  // moment the bundle creates its instance. NEEDS Tampermonkey Sandbox Mode = "Raw" so this runs
+  // before diep's bundle instantiates; otherwise the hook loses the race and nothing is captured
+  // (the panel then shows "memória: NÃO capturada" with the fix). Sets W.__wasmMem / __wasmExports
+  // — the same globals diep-mem-reader used, so both can coexist.
+  ;(function captureWasm() {
+    try {
+      const WA = W.WebAssembly; if (!WA) return
+      const grab = res => {
+        try {
+          const inst = res && (res.instance || res)
+          if (inst && inst.exports && !W.__wasmMem) {
+            const ex = inst.exports
+            const m = (ex.memory instanceof WA.Memory && ex.memory) || Object.values(ex).find(x => x instanceof WA.Memory)
+            if (m && m.buffer) {
+              W.__wasmExports = ex; W.__wasmMem = m
+              try { console.log('%c[octobot] WASM capturada:', 'color:#0f0', m.buffer.byteLength, 'bytes,', Object.keys(ex).length, 'exports') } catch (e) {}
+            }
+          }
+        } catch (e) {}
+        return res
+      }
+      const oI = WA.instantiate
+      WA.instantiate = function (a, b) { const p = oI.call(this, a, b); return (p && p.then) ? p.then(grab) : p }
+      if (WA.instantiateStreaming) { const oS = WA.instantiateStreaming; WA.instantiateStreaming = function (a, b) { return oS.call(this, a, b).then(grab) } }
+      const OI = WA.Instance
+      const Wd = function (m, i) { const inst = new OI(m, i); grab(inst); return inst }
+      Wd.prototype = OI.prototype; WA.Instance = Wd
+    } catch (e) {}
+  })()
 
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
@@ -407,11 +442,21 @@
       mkBtn('🧪 mover', '#7a5c1e', () => bot.moveTest(), 'anda pra direita 0.8s e mede'),
       mkBtn('📡 base', '#1e6a7a', () => { const n = findBase(); uiLog('rescan: ' + n + ' entidades @ ' + BASE + ' (' + BASE_SRC + ')', n ? '#6f6' : '#f66') }, 're-descobre a lista de entidades'),
     )
+    const setup = document.createElement('div')
+    setup.style.cssText = 'margin-top:6px;padding:6px 7px;background:#3a0d0d;border:1px solid #b44;border-radius:6px;color:#fbb;display:none;font-size:10px;line-height:1.45'
+    setup.innerHTML = '⚠ <b style="color:#f88">memória não capturada</b> — o bot não lê o jogo.<br>' +
+      '<b>1.</b> ícone Tampermonkey → <b>Painel de controle</b><br>' +
+      '<b>2.</b> aba <b>Configurações</b> → "Modo de config" = <b>Avançado</b><br>' +
+      '<b>3.</b> role até <b>Modo Sandbox</b> → escolha <b>Raw</b><br>' +
+      '<b>4.</b> confirme que <i>Diep OctoBot</i> está <b>ligado</b><br>' +
+      '<b>5.</b> volte ao diep.io e <b>recarregue (F5)</b>'
+    UI.setup = setup
+
     const log = document.createElement('div')
     log.style.cssText = 'margin-top:5px;border-top:1px solid #334;padding-top:4px;max-height:110px;overflow:hidden;word-break:break-word'
     UI.logEl = log
 
-    body.append(btns1, btns2, log)
+    body.append(setup, btns1, btns2, log)
     P.append(head, body)
     document.body.appendChild(P)
     UI.root = P
@@ -423,7 +468,8 @@
   function uiRefresh() {
     if (!UI.root || UI.min) return
     const r = ready()
-    setRow(UI.rows.mem, r ? 'capturada ✔' : 'NÃO capturada (F5)', r ? '#6f6' : '#f66')
+    setRow(UI.rows.mem, r ? 'capturada ✔' : 'NÃO capturada', r ? '#6f6' : '#f66')
+    if (UI.setup) UI.setup.style.display = r ? 'none' : 'block'
     if (!r) { setRow(UI.rows.st, 'aguardando heap…', '#fa0'); return }
     // light scan while idle so the panel is truthful before the bot is on
     if (!bot.on) {
@@ -469,5 +515,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.7] loaded — painel na tela (canto sup. direito).', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.8] loaded — captura própria + painel na tela.', 'color:#f0f;font-weight:bold')
 })()

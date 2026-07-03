@@ -6,7 +6,7 @@
 //              'fallen' (Booster rammer that hunts the player) and 'octo' (orbit turret).
 //              For private Sandbox use only. SELF-CONTAINED (captures WASM itself; the separate
 //              diep-mem-reader is optional).
-// @version      0.9
+// @version      0.10
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -78,6 +78,7 @@
     } catch (e) {}
   })()
 
+  const VERSION = '0.10'
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
   // stat keys '1'..'8' = 49..56. Build orders (priority-first; 8 presses each):
@@ -157,29 +158,56 @@
   const WORLD = 582904, STATIC_BASE = WORLD + 1120, REG = 467744
   let BASE = 0, BASE_SRC = 'none', _dryScans = 0
   const liveNode = nd => ok(nd) && u16(nd + 116) !== 6875
-  function countBase(b) {
-    if (!ok(b + 7196)) return 0
-    let n = 0
+  // Scan a candidate container: count live nodes AND detect a "self" node — a valid-health entity
+  // sitting at camera-relative origin. ONLY the currently-active arena container has the local tank
+  // at ~(0,0); stale/old containers linger in memory full of garbage but have no near-origin tank.
+  // Picking by node count alone chose a wrong container (47 fake "tanks", phantom target @2490u).
+  function scanBase(b) {
+    if (!ok(b + 7196)) return { n: 0, self: false }
+    let n = 0, self = false
     try {
       for (let pr = 0; pr < 16384; pr++) {
         if (!((u8(b + 796 + (pr >> 3)) >> (pr & 7)) & 1)) continue
         const pg = u32(b + 6940 + ((pr >> 8) << 2)); if (!ok(pg)) continue
-        if (liveNode((pg + (pr & 255) * 224) >>> 0)) n++
+        const nd = (pg + (pr & 255) * 224) >>> 0; if (!liveNode(nd)) continue
+        n++
+        if (!self) {
+          const R = u32(nd + 172)
+          if (ok(R)) {
+            const ox = decode(u32(R + 144)), oy = decode(u32(R + 164))
+            if (Number.isFinite(ox) && Math.abs(ox) < 120 && Math.abs(oy) < 120) {
+              const H = u32(nd + 176)
+              if (ok(H)) { const r = f32(H + 48); if (r >= -0.02 && r <= 1.02) self = true }
+            }
+          }
+        }
       }
     } catch (e) {}
-    return n
+    return { n, self }
   }
-  function findBase() {
-    const seen = new Set([STATIC_BASE]), cands = [STATIC_BASE]
-    for (let i = 0; i < 65536 && cands.length < 64; i++) {
+  function regCandidates() {
+    const seen = new Set([STATIC_BASE]), cands = []
+    for (let i = 0; i < 65536 && cands.length < 96; i++) {
       const c = u32(REG + i * 4); if (!ok(c)) continue
       const b = (c + 12) >>> 0
       if (!seen.has(b)) { seen.add(b); cands.push(b) }
     }
+    return cands
+  }
+  function findBase() {
+    // 1) static container holding self -> authoritative
+    const st = scanBase(STATIC_BASE)
+    if (st.self) { BASE = STATIC_BASE; BASE_SRC = 'static+self'; return st.n }
+    // 2) registry container holding self -> pick the richest such
+    const cands = regCandidates()
     let best = 0, bestN = 0
-    for (const b of cands) { const n = countBase(b); if (n > bestN) { bestN = n; best = b } }
-    if (best) { BASE = best; BASE_SRC = (best === STATIC_BASE ? 'static' : 'registry') }
-    return bestN
+    for (const b of cands) { const r = scanBase(b); if (r.self && r.n > bestN) { bestN = r.n; best = b } }
+    if (best) { BASE = best; BASE_SRC = 'registry+self'; return bestN }
+    // 3) no self found anywhere (dead/loading) -> fall back to the richest container
+    let fb = STATIC_BASE, fbn = st.n
+    for (const b of cands) { const r = scanBase(b); if (r.n > fbn) { fbn = r.n; fb = b } }
+    BASE = fb; BASE_SRC = (fb === STATIC_BASE ? 'static?' : 'registry?')
+    return fbn
   }
   // owner test (CONFIRMED, funcs 151/161/224): relations component @node+124 holds the spawner's
   // id-tuple at +8..+18 with validity byte @+20; null tuple = (24603,_,6875,_,30379). An entity
@@ -202,11 +230,13 @@
       const R = u32(node + 172); if (!ok(R)) continue
       const rx = decode(u32(R + 144)), ry = decode(u32(R + 164))
       if (!Number.isFinite(rx) || !Number.isFinite(ry)) continue
+      const H = u32(node + 176)
+      let hp = NaN; if (ok(H)) { const r = f32(H + 48); if (Number.isFinite(r)) hp = Math.max(0, Math.min(1, r)) }
       const named = ok(u32(node + 168)), owned = isOwned(node)
       out.push({
-        node, R, ox: rx, oy: ry, dist: Math.hypot(rx, ry),
+        node, R, ox: rx, oy: ry, dist: Math.hypot(rx, ry), hp,
         named, owned,
-        tank: named && !owned,   // real tank (player or named AI); excludes projectiles/shapes
+        tank: named && !owned && hp > 0,   // real live tank; excludes projectiles/shapes/garbage
       })
     }
     if (!out.length) { if (++_dryScans >= 15) { _dryScans = 0; findBase() } } else _dryScans = 0
@@ -342,6 +372,21 @@
         moved ? '#6f6' : '#f66')
     }, 800)
   }
+  // dump every candidate container + the nearest entities of the chosen one (F12 console)
+  bot.diag = function () {
+    if (!ready()) { uiLog('não pronto', '#f66'); return }
+    const rows = [{ base: STATIC_BASE, src: 'static', ...scanBase(STATIC_BASE) }]
+    for (const b of regCandidates()) { const r = scanBase(b); if (r.n > 0) rows.push({ base: b, src: 'reg', ...r }) }
+    console.log('%c[diag] containers candidatos (self=contém você):', 'color:#0ff'); console.table(rows)
+    findBase()
+    console.log('[diag] USANDO base', BASE, BASE_SRC)
+    const es = entities()
+    console.table(es.slice().sort((a, c) => a.dist - c.dist).slice(0, 15).map(e => ({
+      dist: Math.round(e.dist), tank: e.tank, named: e.named, owned: e.owned,
+      hp: +(e.hp || 0).toFixed(2), ox: Math.round(e.ox), oy: Math.round(e.oy),
+    })))
+    uiLog('diag no console (F12): ' + rows.length + ' containers, base ' + BASE_SRC, '#9ad')
+  }
 
   // ---- loadout helpers (Sandbox menu/cheats are DOM) ----
   const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -411,7 +456,7 @@
     const head = document.createElement('div')
     head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;cursor:move;margin-bottom:4px'
     const title = document.createElement('span')
-    title.innerHTML = '<b style="color:#f6f">🤖 OctoBot v0.7</b>'
+    title.innerHTML = '<b style="color:#f6f">🤖 OctoBot v' + VERSION + '</b>'
     const minB = document.createElement('span')
     minB.textContent = '—'
     minB.style.cssText = 'cursor:pointer;padding:0 6px;color:#aaa;font-weight:bold'
@@ -454,7 +499,8 @@
         uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
       }, 'liga/desliga o cérebro (tecla B)'),
       mkBtn('🧪 mover', '#7a5c1e', () => bot.moveTest(), 'anda pra direita 0.8s e mede'),
-      mkBtn('📡 base', '#1e6a7a', () => { const n = findBase(); uiLog('rescan: ' + n + ' entidades @ ' + BASE + ' (' + BASE_SRC + ')', n ? '#6f6' : '#f66') }, 're-descobre a lista de entidades'),
+      mkBtn('📡 base', '#1e6a7a', () => { const n = findBase(); uiLog('rescan: ' + n + ' entid. @ ' + BASE + ' (' + BASE_SRC + ')', n ? '#6f6' : '#f66') }, 're-descobre a lista de entidades'),
+      mkBtn('🔍 diag', '#6a1e6a', () => bot.diag(), 'lista containers + entidades no console (F12)'),
     )
     const setup = document.createElement('div')
     setup.style.cssText = 'margin-top:6px;padding:6px 7px;background:#3a0d0d;border:1px solid #b44;border-radius:6px;color:#fbb;display:none;font-size:10px;line-height:1.45'
@@ -529,5 +575,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.9] loaded — alvo por dono (tanque real) + captura própria + painel.', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.10] loaded — base por self-na-origem + diag', 'color:#f0f;font-weight:bold')
 })()

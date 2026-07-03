@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Diep OctoBot (aggressive sandbox bot)
-// @description  Autonomous aggressive bot for diep.io SANDBOX duels. Reads every entity from
-//              WASM memory and DRIVES the tank (aim / move / fire) through the game's own WASM
-//              input exports. Modes: 'fallen' (Booster rammer that hunts the player) and 'octo'
-//              (turret/orbit shooter). For private Sandbox use only. Needs diep-mem-reader.
-// @version      0.6
+// @description  Autonomous aggressive bot for diep.io SANDBOX duels with an on-screen control
+//              panel (no console needed). Reads every entity from WASM memory and DRIVES the
+//              tank (aim / move / fire) through the game's own WASM input exports. Modes:
+//              'fallen' (Booster rammer that hunts the player) and 'octo' (orbit turret).
+//              For private Sandbox use only. Requires diep-mem-reader.
+// @version      0.7
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -12,34 +13,29 @@
 // ==/UserScript==
 
 /*
- * REQUIRES: diep-mem-reader.user.js installed (Tampermonkey Sandbox Mode = "Raw") — it captures
- *   window.__wasmMem and window.__wasmExports.
+ * REQUIRES: diep-mem-reader.user.js installed (Tampermonkey Sandbox Mode = "Raw").
  *
- * DUEL SETUP (the bot needs its OWN tank — two clients on the same party link):
- *   Window A (you)  : your sandbox tab. Leave the bot OFF here.
- *   Window B (bot)  : same party link in a second window. Spawn, then run diepBot.start('fallen').
- *   Keep BOTH windows VISIBLE side by side — Chrome freezes rAF and throttles timers to 1/s in
- *   background tabs, which turns the bot into a statue. (v0.5 adds a Worker-based tick loop that
- *   survives backgrounding, but side-by-side is still the reliable way.)
+ * UI: a draggable panel appears top-right on diep.io. Buttons:
+ *   ▶ FALLEN  — turnkey Booster rammer duel bot (spawn -> max level -> ram build -> ON)
+ *   ▶ OCTO    — turnkey orbit-turret bot
+ *   ⚔ ON/OFF  — toggle the brain (same as pressing B)
+ *   🧪 mover  — movement self-test (drives right 0.8s, reports dx/dy)
+ *   📡 base   — re-scan the entity-store base (arena switch)
+ * The status rows (memória/base/entidades/eu/alvo/loop) update live; the log shows what the
+ * bot is doing. Click the tank tree yourself when asked (fallen: Flank Guard -> Tri-Angle ->
+ * Booster; octo: Twin -> Quad Tank -> Octo Tank).
  *
- * CONTROL (all LIVE-VALIDATED):
- *   - AIM  : __wasmExports.va(px,py) (= _cpp_set_mouse_pos; screen device px, top-left origin).
- *   - FIRE : mem byte 560660 = 1/0 (autofire latch). For Booster this doubles as THRUST — the
- *            rear barrels' recoil pushes the tank toward the mouse.
- *   - MOVE : __wasmExports.ua(keyCode, 1|0). W87 A65 S83 D68. Gate: i32@560772 must be 0
- *            (func 1298 skips ALL WASD reads otherwise) — forced 0 every tick.
+ * DUEL SETUP: two windows on the same party link, SIDE BY SIDE (both visible).
+ *   Window A (you): play normally, leave the bot OFF.
+ *   Window B (bot): press ▶ FALLEN on the panel.
  *
- * MODES:
- *   'fallen' — Fallen-Booster-style rammer: locks onto NAMED actors (u32[node+168]!=0 = has a
- *              server-sent nametag: player tanks — and named AI bosses), aims AT the target,
- *              holds fire (recoil thrust) and rams. Flees below retreatHP. Build: body/HP/speed.
- *   'octo'   — orbiting turret: nearest target, circle-strafe, keep distance, shoot.
- *
- * USAGE: sandbox -> spawn -> console:  diepBot.start('fallen')
- *   Clicks Play, Max Level, allocates stats (mode build), runs a movement self-test, then turns
- *   ON. Click the tank tree yourself in the grace window:
- *     fallen: Flank Guard -> Tri-Angle -> Booster       octo: Twin -> Quad Tank -> Octo Tank
- *   Toggle: B  |  Diagnostics: diepBot.status()  |  Prove move: diepBot.moveTest()
+ * CONTROL (all LIVE-VALIDATED): aim = __wasmExports.va(px,py); fire = mem byte 560660;
+ * move = __wasmExports.ua(87/65/83/68, 1|0) with text-gate i32@560772 forced 0 each tick.
+ * ENTITIES (verified via adversarial WAT workflows): per-arena container discovered through
+ * the registry ring @467744 (base=container+12); node liveness = occupancy bitmap + generation
+ * u16@node+116 != 6875; renderable ptr @node+172 (pos = decode(+144/+164), camera-relative);
+ * health ratio @ (node+176)+48; named actor (player/boss) = u32[node+168] != 0; self = camera
+ * object from vector @BASE+676 (raw u16 id match; u16(cam+68)==6875 means DEAD -> auto respawn).
  */
 
 ;(() => {
@@ -60,20 +56,17 @@
     MODE: 'fallen',        // 'fallen' (rammer, hunts the player) | 'octo' (orbit turret)
     FIRE: true,
     PREFER_PLAYERS: true,  // lock onto named actors first (players/bosses: u32[node+168]!=0)
-    // geometry (world units; render coords are camera-relative world units)
-    keepDist: 230,         // octo: orbit range
-    tooClose: 130,         // octo: back off inside this
-    farmFire: 900,         // octo: fire only within this range (fallen always fires = thrust)
-    retreatHP: 0.20,       // flee below this health ratio
+    keepDist: 230, tooClose: 130, farmFire: 900,
+    retreatHP: 0.20,
     strafeGain: 0.85, strafeFlip: 55,
-    deadzone: 0.10,        // normalized move threshold
-    AIM_ZOOM: true,        // scale aim offset by live zoom decode(u32@591572)
-    AIM_SCALE: 1.0,
+    deadzone: 0.10,
+    AIM_ZOOM: true, AIM_SCALE: 1.0,
     // internals
     _held: { up: false, down: false, left: false, right: false },
     _dv4: new DataView(new ArrayBuffer(4)),
     _strafeDir: 1, _strafeT: 0, _frame: 0, _target: null, _self: null,
-    _ticks: 0, _rate: 0, _warnedSlow: 0,
+    _ticks: 0, _rate: 0, _warnedSlow: 0, _deadTicks: 0,
+    _entCount: 0, _namedCount: 0,
   }
   W.diepBot = bot
 
@@ -112,24 +105,20 @@
   function stopMove() { setMove({ up: false, down: false, left: false, right: false }) }
   function fire(on) { try { setU8(FIRE_BYTE, on ? 1 : 0) } catch (e) {} }
   function aimPx(px, py) { try { E().va(px | 0, py | 0) } catch (e) {} }
-  // move toward a normalized direction (mx,my), camera-relative axes (+x right, +y down)
   function moveVec(mx, my) {
     const dz = bot.deadzone
     setMove({ right: mx > dz, left: mx < -dz, down: my > dz, up: my < -dz })
   }
 
-  // ---- camera + zoom ----
   const camX = () => f32(591660), camY = () => f32(591664)
   function zoom() { if (!bot.AIM_ZOOM) return 1; const z = decode(u32(591572)); return (Number.isFinite(z) && z > 0 && z < 100) ? z : 1 }
 
-  // ---- entity store base — DISCOVERED, not hardcoded (v0.6 fix) ----
-  // The live entity container is PER-ARENA: sometimes the static WORLD+1108 object, sometimes a
-  // heap container registered in the id->container ring @467744 (func 77/266). Hardcoding the
-  // static base made the bot see 0 entities in fresh arenas (=> it stood still doing nothing).
-  // We score every candidate base (container+12) by live-bitmap nodes and adopt the best;
-  // re-scan automatically if the store goes dry (arena switch).
-  // Node liveness: bitmap bit + generation u16@node+116 != 6875. (6875 encodes generation 0 =
-  // never used; the old ===6954 check meant generation==1 and silently dropped reused slots.)
+  // ---- entity store base — DISCOVERED, not hardcoded ----
+  // The live entity container is PER-ARENA (heap container registered in the id->container ring
+  // @467744). Hardcoding the static base made the bot see 0 entities in fresh arenas. We score
+  // every candidate base (container+12) by live-bitmap nodes and adopt the best; re-scan if dry.
+  // Node liveness: bitmap bit + generation u16@node+116 != 6875 (gen-0 = never used; the old
+  // ===6954 check meant generation==1 and silently dropped reused slots).
   const WORLD = 582904, STATIC_BASE = WORLD + 1120, REG = 467744
   let BASE = 0, BASE_SRC = 'none', _dryScans = 0
   const liveNode = nd => ok(nd) && u16(nd + 116) !== 6875
@@ -194,6 +183,7 @@
     for (const e of es) if (e.dist < 60 && (!best || e.dist < best.dist)) best = e
     return best
   }
+
   function selfHealth() {
     const s = bot._self; if (!s) return 1
     const H = u32(s.node + 176); if (!ok(H)) return 1
@@ -223,14 +213,16 @@
     // dead? stop everything and try to respawn every ~2s (camera gen == 6875 => no tank)
     if (selfDead()) {
       stopMove(); fire(false)
-      bot._deadTicks = (bot._deadTicks || 0) + 1
-      if (bot._deadTicks % 60 === 1) bot.spawn()
+      bot._deadTicks++
+      if (bot._deadTicks % 60 === 1) { uiLog('morri — respawnando…', '#fa0'); bot.spawn() }
       return
     }
     bot._deadTicks = 0
 
     if ((bot._frame++ & 3) === 0) {
       const es = entities()
+      bot._entCount = es.length
+      bot._namedCount = es.filter(e => e.named).length
       bot._self = findSelf(es)
       bot._target = pickTarget(es, bot._self)
     } else refresh(bot._target)
@@ -244,20 +236,20 @@
     const fleeing = selfHealth() < bot.retreatHP
 
     if (bot.MODE === 'fallen') {
-      // ===== Fallen Booster: ram the target. Firing = rear-barrel recoil thrust toward the mouse.
+      // Fallen Booster: ram the target. Firing = rear-barrel recoil thrust toward the mouse.
       if (fleeing) {
         aimPx(cw / 2 - t.ox * z, ch / 2 - t.oy * z)   // aim AWAY -> thrust boosts the escape
         fire(true)
         moveVec(-ux, -uy)
       } else {
-        aimPx(cw / 2 + t.ox * z, ch / 2 + t.oy * z)   // aim AT the player = thrust INTO the ram
+        aimPx(cw / 2 + t.ox * z, ch / 2 + t.oy * z)   // aim AT the target = thrust INTO the ram
         fire(bot.FIRE)
-        moveVec(ux, uy)                                // full chase, no keep-distance
+        moveVec(ux, uy)
       }
       return
     }
 
-    // ===== octo: orbiting turret =====
+    // octo: orbiting turret
     aimPx(cw / 2 + t.ox * z, ch / 2 + t.oy * z)
     fire(bot.FIRE && t.dist < bot.farmFire)
     let mx = 0, my = 0
@@ -272,7 +264,7 @@
     moveVec(mx, my)
   }
 
-  // ---- diagnostics ----
+  // ---- diagnostics (console versions kept for power users) ----
   bot.status = function () {
     const r = ready()
     const s = { ready: r, on: bot.on, mode: bot.MODE, ticksPerSec: bot._rate }
@@ -289,17 +281,16 @@
     console.table(s); return s
   }
   bot.moveTest = function (dir = 'right') {
-    if (!ready()) { console.warn('[octobot] not ready'); return }
+    if (!ready()) { uiLog('não pronto — mem não capturada', '#f66'); return }
     gates()
     const x0 = camX(), y0 = camY()
-    console.log('[octobot] moveTest', dir, 'BEFORE', x0.toFixed(1), y0.toFixed(1), 'gate560772=', i32(G_TEXT))
+    uiLog('teste de movimento (' + dir + ')…', '#9ad')
     move(dir, true)
     setTimeout(() => {
       const x1 = camX(), y1 = camY(); move(dir, false)
       const moved = Math.hypot(x1 - x0, y1 - y0) > 0.5
-      console.log('%c[octobot] moveTest ' + (moved ? 'PASS' : 'FAIL') + ' dx=' + (x1 - x0).toFixed(1) + ' dy=' + (y1 - y0).toFixed(1),
-        'color:' + (moved ? '#0f0' : '#f33') + ';font-weight:bold')
-      if (!moved) console.log('[octobot] no move -> spawned? window visible? 560772==0? not in a menu? Try diepBot.status().')
+      uiLog('movimento: ' + (moved ? 'OK ✔ dx=' + (x1 - x0).toFixed(0) : 'FALHOU ✖ (spawnado? janela visível?)'),
+        moved ? '#6f6' : '#f66')
     }, 800)
   }
 
@@ -313,46 +304,161 @@
     if (els[0]) { els[0].click(); return true }
     return false
   }
-  bot.spawn = function () { if (!clickByText('^Play')) console.warn('[octobot] Play button not found — click Play manually') }
+  bot.spawn = function () { if (!clickByText('^Play')) uiLog('botão Play não achado — clique Play', '#fa0') }
   bot.maxStats = function (order) {
     order = order || BUILDS[bot.MODE] || BUILDS.octo
-    const q = []; for (const k of order) for (let i = 0; i < 8; i++) q.push(k)   // priority-first
+    const q = []; for (const k of order) for (let i = 0; i < 8; i++) q.push(k)
     const id = setInterval(() => {
       const k = q.shift(); if (k == null) return clearInterval(id)
       try { E().ua(k, 1); E().ua(k, 0) } catch (e) {}
     }, 60)
   }
   bot.maxLevel = function () {
-    if (!clickByText('Max Level')) { clickByText('Sandbox|Cheat'); setTimeout(() => { if (!clickByText('Max Level')) console.warn('[octobot] Max Level not found — open the flask panel and click it'); }, 200) }
+    if (!clickByText('Max Level')) { clickByText('Sandbox|Cheat'); setTimeout(() => { if (!clickByText('Max Level')) uiLog('Max Level não achado — abra o frasco e clique', '#fa0') }, 200) }
   }
   bot.start = async function (mode) {
     if (mode) bot.MODE = mode
+    if (!ready()) { uiLog('mem não capturada — recarregue (F5) e tente de novo', '#f66'); return }
+    uiLog('start ' + bot.MODE + ': spawn…')
     bot.spawn(); await sleep(1300)
     bot.maxLevel(); await sleep(900)
     bot.maxStats(); await sleep(400)
-    const tree = bot.MODE === 'fallen' ? 'Flank Guard -> Tri-Angle -> BOOSTER' : 'Twin -> Quad Tank -> OCTO TANK'
-    console.log('%c[octobot] spawned + maxed (' + bot.MODE + ' build). Click the tank tree: ' + tree, 'color:#0ff')
+    const tree = bot.MODE === 'fallen' ? 'Flank Guard → Tri-Angle → BOOSTER' : 'Twin → Quad → OCTO TANK'
+    uiLog('CLIQUE a árvore: ' + tree, '#0ff')
     bot.moveTest('right')
-    setTimeout(() => { bot.on = true; console.log('%c[octobot] ON — hunting (' + bot.MODE + '). B toggles, diepBot.status() inspects.', 'color:#f0f;font-weight:bold') }, 6000)
+    setTimeout(() => { bot.on = true; uiLog('BOT ON — caçando (' + bot.MODE + ')', '#f0f') }, 6000)
   }
 
+  // ================= UI PANEL (no console needed) =================
+  const UI = { root: null, body: null, logEl: null, rows: {}, lines: [], min: false }
+  function uiLog(msg, color) {
+    const t = new Date().toTimeString().slice(0, 8)
+    UI.lines.push('<div style="color:' + (color || '#ccc') + '">[' + t + '] ' + msg + '</div>')
+    if (UI.lines.length > 7) UI.lines.shift()
+    if (UI.logEl) UI.logEl.innerHTML = UI.lines.join('')
+    try { console.log('[octobot] ' + msg) } catch (e) {}
+  }
+  function setRow(el, txt, color) { if (el) { el.textContent = txt; el.style.color = color || '#eee' } }
+  function mkBtn(label, bg, fn, title) {
+    const b = document.createElement('button')
+    b.textContent = label
+    if (title) b.title = title
+    b.setAttribute('tabindex', '-1')
+    b.style.cssText = 'flex:1;margin:2px;padding:6px 2px;background:' + bg + ';color:#fff;border:0;border-radius:6px;font:bold 11px monospace;cursor:pointer;'
+    b.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); try { fn() } catch (err) { uiLog('erro: ' + err.message, '#f66') } b.blur() })
+    return b
+  }
+  function buildUI() {
+    if (UI.root || !document.body) return
+    const P = document.createElement('div')
+    P.id = '__octobot_panel'
+    P.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;width:236px;' +
+      'background:rgba(8,8,18,.92);color:#eee;font:11px/1.5 monospace;border:1px solid #b0b;' +
+      'border-radius:10px;padding:7px 9px;user-select:none;box-shadow:0 4px 18px rgba(0,0,0,.5)'
+    // keep panel interactions away from the game's global listeners
+    for (const ev of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'wheel', 'keydown', 'keyup'])
+      P.addEventListener(ev, e => e.stopPropagation())
+
+    const head = document.createElement('div')
+    head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;cursor:move;margin-bottom:4px'
+    const title = document.createElement('span')
+    title.innerHTML = '<b style="color:#f6f">🤖 OctoBot v0.7</b>'
+    const minB = document.createElement('span')
+    minB.textContent = '—'
+    minB.style.cssText = 'cursor:pointer;padding:0 6px;color:#aaa;font-weight:bold'
+    minB.addEventListener('click', e => { e.stopPropagation(); UI.min = !UI.min; UI.body.style.display = UI.min ? 'none' : 'block'; minB.textContent = UI.min ? '□' : '—' })
+    head.append(title, minB)
+
+    // drag
+    let drag = null
+    head.addEventListener('mousedown', e => { drag = { x: e.clientX - P.offsetLeft, y: e.clientY - P.offsetTop }; e.preventDefault() })
+    window.addEventListener('mousemove', e => { if (drag) { P.style.left = (e.clientX - drag.x) + 'px'; P.style.top = (e.clientY - drag.y) + 'px'; P.style.right = 'auto' } })
+    window.addEventListener('mouseup', () => { drag = null })
+
+    const body = document.createElement('div')
+    UI.body = body
+    const row = (label) => {
+      const r = document.createElement('div')
+      r.style.cssText = 'display:flex;justify-content:space-between'
+      const l = document.createElement('span'); l.textContent = label; l.style.color = '#8af'
+      const v = document.createElement('span'); v.textContent = '—'
+      r.append(l, v); body.appendChild(r); return v
+    }
+    UI.rows.mem = row('memória')
+    UI.rows.base = row('base')
+    UI.rows.ents = row('entidades')
+    UI.rows.self = row('eu')
+    UI.rows.tgt = row('alvo')
+    UI.rows.loop = row('loop')
+    UI.rows.st = row('estado')
+
+    const btns1 = document.createElement('div'); btns1.style.cssText = 'display:flex;margin-top:5px'
+    btns1.append(
+      mkBtn('▶ FALLEN', '#a1206e', () => bot.start('fallen'), 'spawn + max + build rammer + ON (clique a árvore até Booster)'),
+      mkBtn('▶ OCTO', '#20a16e', () => bot.start('octo'), 'spawn + max + build atirador + ON (árvore até Octo)'),
+    )
+    const btns2 = document.createElement('div'); btns2.style.cssText = 'display:flex'
+    btns2.append(
+      mkBtn('⚔ ON/OFF', '#444a99', () => {
+        bot.on = !bot.on
+        if (!bot.on) { stopMove(); fire(false) }
+        uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
+      }, 'liga/desliga o cérebro (tecla B)'),
+      mkBtn('🧪 mover', '#7a5c1e', () => bot.moveTest(), 'anda pra direita 0.8s e mede'),
+      mkBtn('📡 base', '#1e6a7a', () => { const n = findBase(); uiLog('rescan: ' + n + ' entidades @ ' + BASE + ' (' + BASE_SRC + ')', n ? '#6f6' : '#f66') }, 're-descobre a lista de entidades'),
+    )
+    const log = document.createElement('div')
+    log.style.cssText = 'margin-top:5px;border-top:1px solid #334;padding-top:4px;max-height:110px;overflow:hidden;word-break:break-word'
+    UI.logEl = log
+
+    body.append(btns1, btns2, log)
+    P.append(head, body)
+    document.body.appendChild(P)
+    UI.root = P
+    uiLog('painel pronto. Abra o Sandbox e clique ▶ FALLEN.', '#6f6')
+  }
+  // build as soon as body exists (we run at document-start)
+  const uiBoot = setInterval(() => { if (document.body) { clearInterval(uiBoot); try { buildUI() } catch (e) {} } }, 300)
+
+  function uiRefresh() {
+    if (!UI.root || UI.min) return
+    const r = ready()
+    setRow(UI.rows.mem, r ? 'capturada ✔' : 'NÃO capturada (F5)', r ? '#6f6' : '#f66')
+    if (!r) { setRow(UI.rows.st, 'aguardando heap…', '#fa0'); return }
+    // light scan while idle so the panel is truthful before the bot is on
+    if (!bot.on) {
+      const es = entities()
+      bot._entCount = es.length
+      bot._namedCount = es.filter(e => e.named).length
+      bot._self = findSelf(es)
+      bot._target = pickTarget(es, bot._self)
+    }
+    setRow(UI.rows.base, BASE ? BASE + ' (' + BASE_SRC + ')' : 'não achada', BASE ? '#6f6' : '#f66')
+    setRow(UI.rows.ents, bot._entCount + ' (' + bot._namedCount + ' c/ nome)', bot._entCount ? '#6f6' : '#f66')
+    const dead = selfDead()
+    setRow(UI.rows.self, dead ? 'MORTO' : (bot._self ? 'vivo · HP ' + Math.round(selfHealth() * 100) + '%' : '—'), dead ? '#f66' : '#6f6')
+    const t = bot._target
+    setRow(UI.rows.tgt, t ? Math.round(t.dist) + 'u ' + (t.named ? '(tanque!)' : '(shape)') : 'nenhum', t ? (t.named ? '#f6f' : '#fd6') : '#888')
+    setRow(UI.rows.loop, bot._rate + ' t/s', bot._rate >= 15 ? '#6f6' : '#fa0')
+    setRow(UI.rows.st, (bot.on ? 'CAÇANDO' : 'parado') + ' · ' + bot.MODE, bot.on ? '#f0f' : '#aaa')
+  }
+  setInterval(uiRefresh, 500)
+
   // ---- tick loop: Worker-driven so it keeps running when the tab is backgrounded ----
-  // Chrome freezes rAF and throttles main-thread timers to >=1s in background tabs; a dedicated
-  // Worker's setInterval is not throttled, and its postMessage wakes the main thread promptly.
   let _lastTick = 0
   function tickGuard() { const n = performance.now(); if (n - _lastTick < 30) return; _lastTick = n; try { tick() } catch (e) {} }
   try {
     const wsrc = 'setInterval(function(){postMessage(0)},40)'
     const wk = new Worker(URL.createObjectURL(new Blob([wsrc], { type: 'application/javascript' })))
     wk.onmessage = tickGuard
-  } catch (e) { console.warn('[octobot] Worker loop blocked (CSP?) — falling back to timers; keep this window VISIBLE') }
-  setInterval(tickGuard, 50)                                        // fallback (throttled in bg)
-  ;(function raf() { tickGuard(); requestAnimationFrame(raf) })()   // smoothness when visible
+  } catch (e) { /* CSP — fall back to timers below */ }
+  setInterval(tickGuard, 50)
+  ;(function raf() { tickGuard(); requestAnimationFrame(raf) })()
   setInterval(() => {
-    bot._rate = bot._ticks / 2; bot._ticks = 0
+    bot._rate = Math.round(bot._ticks / 2); bot._ticks = 0
     if (bot.on && bot._rate < 15 && Date.now() - bot._warnedSlow > 10000) {
       bot._warnedSlow = Date.now()
-      console.warn('[octobot] only ' + bot._rate + ' ticks/s — window is backgrounded/throttled. Keep it VISIBLE (side by side).')
+      uiLog('só ' + bot._rate + ' t/s — deixe esta janela VISÍVEL', '#fa0')
     }
   }, 2000)
 
@@ -360,9 +466,8 @@
     if (e.key === 'b' || e.key === 'B') {
       bot.on = !bot.on
       if (!bot.on) { stopMove(); fire(false) }
-      console.log('%c[octobot] ' + (bot.on ? 'ON — hunting (' + bot.MODE + ')' : 'OFF'), 'color:#f0f;font-weight:bold')
+      uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.5] loaded. Sandbox -> spawn -> diepBot.start(\'fallen\') (Booster rammer) or diepBot.start(\'octo\'). B toggles.',
-    'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.7] loaded — painel na tela (canto sup. direito).', 'color:#f0f;font-weight:bold')
 })()

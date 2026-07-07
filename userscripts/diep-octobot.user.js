@@ -6,7 +6,7 @@
 //              level-1->45 duel: auto-spawn, auto-allocate stats to the build, auto-evolve the
 //              tank tree. Modes: 'fallen' (Booster rammer) and 'overlord' (drone turret).
 //              For private Sandbox use only. SELF-CONTAINED (captures WASM itself).
-// @version      0.14
+// @version      0.15
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -80,7 +80,7 @@
     } catch (e) {}
   })()
 
-  const VERSION = '0.14'
+  const VERSION = '0.15'
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
   // stat keys '1'..'8' = keyCodes 49..56. diep stat order:
@@ -181,7 +181,7 @@
   // Node liveness: bitmap bit + generation u16@node+116 != 6875 (gen-0 = never used; the old
   // ===6954 check meant generation==1 and silently dropped reused slots).
   const WORLD = 582904, STATIC_BASE = WORLD + 1120, REG = 467744
-  let BASE = 0, BASE_SRC = 'none', _dryScans = 0
+  let BASE = 0, BASE_SRC = 'none', SELF_NODE = 0, FRAME = 'world', _dryScans = 0
   const liveNode = nd => ok(nd) && u16(nd + 116) !== 6875
   // Locate SELF robustly by the CAMERA ANCHOR. The local camera world pos is f32@591660/591664
   // (validated to track the player). SELF = the alive, named, unowned tank whose decoded position
@@ -233,6 +233,61 @@
     BASE = fb; BASE_SRC = (fb === STATIC_BASE ? 'static?' : 'registry?')
     return fbn
   }
+
+  // ---- GROUND-TRUTH self/container by MOTION (no address guessing) ----
+  // Press D briefly (verified to move the player: 591660 changed +143). SELF is the tank node whose
+  // decoded position moves consistently with that: in a WORLD frame self moves ~moveAmt while others
+  // stay; in a CAMERA-RELATIVE frame self stays ~0 while others shift ~moveAmt. Lock that node + its
+  // container. This bypasses every layout assumption (which container / camera addr / coord frame).
+  const _sleep = ms => new Promise(r => setTimeout(r, ms))
+  function _wideNodes() {
+    const nodes = [], seen = new Set()
+    for (const b of [STATIC_BASE, ...regCandidates()]) {
+      if (!ok(b + 7196)) continue
+      for (let pr = 0; pr < 16384; pr++) {
+        if (!((u8(b + 796 + (pr >> 3)) >> (pr & 7)) & 1)) continue
+        const pg = u32(b + 6940 + ((pr >> 8) << 2)); if (!ok(pg)) continue
+        const nd = (pg + (pr & 255) * 224) >>> 0; if (!liveNode(nd) || seen.has(nd)) continue
+        const R = u32(nd + 172); if (!ok(R)) continue
+        seen.add(nd); nodes.push({ b, node: nd, R })
+      }
+    }
+    return nodes
+  }
+  async function calibrate() {
+    if (!ready()) { uiLog('calibrar: sem memória', '#f66'); return false }
+    gates()
+    uiLog('calibrando (movendo p/ te achar)…', '#9ad')
+    const nodes = _wideNodes()
+    if (!nodes.length) { uiLog('calibrar: 0 nós vivos', '#f66'); return false }
+    const rd = o => { const x = decode(u32(o.R + 144)), y = decode(u32(o.R + 164)); return [x, y] }
+    const p0 = nodes.map(rd), cx0 = camX(), cy0 = camY()
+    move('right', true); await _sleep(500)
+    const cx1 = camX(), cy1 = camY(); move('right', false)
+    const moveAmt = Math.hypot(cx1 - cx0, cy1 - cy0)
+    if (moveAmt < 8) { uiLog('calibrar FALHOU: tanque não moveu (janela em foco? vivo?)', '#f66'); return false }
+    const p1 = nodes.map(rd)
+    const del = nodes.map((o, i) => {
+      const a = p0[i], b = p1[i]
+      return (Number.isFinite(a[0]) && Number.isFinite(b[0])) ? Math.hypot(b[0] - a[0], b[1] - a[1]) : -1
+    })
+    const movers = del.filter(d => d > moveAmt * 0.6 && d < moveAmt * 1.6).length
+    const camRel = movers > nodes.length * 0.25
+    FRAME = camRel ? 'camrel' : 'world'
+    let self = null, bestFit = Infinity
+    for (let i = 0; i < nodes.length; i++) {
+      const nd = nodes[i].node, d = del[i]; if (d < 0) continue
+      const H = u32(nd + 176), hp = ok(H) ? f32(H + 48) : NaN
+      if (!(ok(u32(nd + 168)) && !isOwned(nd) && hp > 0.01 && hp <= 1.02)) continue   // a tank
+      const fit = camRel ? d : Math.abs(d - moveAmt)     // camrel self~0 ; world self~moveAmt
+      if (fit < bestFit) { bestFit = fit; self = nodes[i] }
+    }
+    if (!self || bestFit > moveAmt * 0.7) { uiLog('calibrar: self não distinguível (fit ' + Math.round(bestFit) + '/' + Math.round(moveAmt) + ')', '#fa0'); return false }
+    SELF_NODE = self.node; BASE = self.b; BASE_SRC = 'calibrado'
+    uiLog('CALIBRADO ✔ base=' + BASE + ' frame=' + FRAME + ' (moveu ' + Math.round(moveAmt) + ')', '#6f6')
+    return true
+  }
+  bot.calibrate = calibrate
   // owner test (CONFIRMED, funcs 151/161/224): relations component @node+124 holds the spawner's
   // id-tuple at +8..+18 with validity byte @+20; null tuple = (24603,_,6875,_,30379). An entity
   // WITH a valid non-null owner is a projectile/drone/trap (never a target for the rammer). A tank
@@ -270,9 +325,13 @@
   }
   // dead/loading when we can't resolve a self node (drives the auto-respawn)
   function selfDead() { return !bot._self }
-  // SELF = the alive, named, unowned tank whose decoded pos best matches the camera anchor
-  // (world 591660/591664 OR camera-relative origin). Garbage/dead nodes are far from both -> rejected.
+  // SELF = the motion-calibrated node (ground truth). If it's gone (died/reused), drop it and try
+  // the camera-anchor heuristic as a fallback (works only if the coord frame matches).
   function findSelf(es) {
+    if (SELF_NODE) {
+      for (const e of es) if (e.node === SELF_NODE) return (Number.isFinite(e.hp) && e.hp > 0) ? e : (SELF_NODE = 0, null)
+      SELF_NODE = 0   // calibrated node no longer live
+    }
     const cxw = camX(), cyw = camY()
     let self = null, bestErr = Infinity
     for (const e of es) {
@@ -356,10 +415,10 @@
       bot._target = pickTarget(es, bot._self)
     } else { refresh(bot._self); refresh(bot._target) }
     const self = bot._self, t = bot._target
-    // no self resolved => dead or loading: stop + respawn periodically
+    // no self resolved => dead or loading: stop, respawn + recalibrate periodically
     if (!self) {
       stopMove(); fire(false); bot._deadTicks++
-      if (bot._deadTicks % 120 === 1) { uiLog('sem self (morto/carregando) — respawn', '#fa0'); bot.spawn() }
+      if (bot._deadTicks % 150 === 1) { uiLog('sem self — respawn + recalibrar', '#fa0'); bot.spawn(); setTimeout(() => calibrate(), 1400) }
       return
     }
     bot._deadTicks = 0
@@ -435,6 +494,7 @@
   // dump every candidate container + the nearest entities of the chosen one (F12 console)
   bot.diag = function () {
     if (!ready()) { uiLog('não pronto', '#f66'); return }
+    console.log('[diag] cam(591660/664)=(' + camX().toFixed(0) + ',' + camY().toFixed(0) + ') | SELF_NODE=' + SELF_NODE + ' FRAME=' + FRAME + ' BASE=' + BASE + ' ' + BASE_SRC + ' | wideNodes=' + _wideNodes().length)
     const rows = [{ base: STATIC_BASE, src: 'static', ...scanBase(STATIC_BASE) }]
     for (const b of regCandidates()) { const r = scanBase(b); if (r.n > 0) rows.push({ base: b, src: 'reg', ...r }) }
     console.log('%c[diag] containers candidatos (self=contém você):', 'color:#0ff'); console.table(rows)
@@ -481,12 +541,13 @@
     if (mode) bot.MODE = mode
     if (!ready()) { uiLog('mem não capturada — recarregue (F5) e tente de novo', '#f66'); return }
     uiLog('start ' + bot.MODE + ': Play (nível 1)…')
-    bot._evoStage = 0; bot._evoWasUp = false     // fresh evolution path
-    bot.spawn(); await sleep(1200)
+    bot._evoStage = 0; bot._evoWasUp = false; SELF_NODE = 0    // fresh path
+    bot.spawn(); await sleep(1400)
     setBuild()                                  // start continuous stat allocation for this build
-    uiLog('jogando 1→45: upa stats + evolui sozinho. Árvore: ' + TREE[bot.MODE], '#0ff')
-    bot.moveTest('right')
-    setTimeout(() => { bot.on = true; uiLog('BOT ON — jogando (' + bot.MODE + ')', '#f0f') }, 2500)
+    const okc = await calibrate()               // motion-lock self + container (ground truth)
+    uiLog('jogando 1→45: upa stats + evolui. Árvore: ' + TREE[bot.MODE], '#0ff')
+    bot.on = true
+    uiLog('BOT ON — jogando (' + bot.MODE + ')' + (okc ? '' : ' — se parado, clique 🎯 calib'), '#f0f')
   }
 
   // ================= UI PANEL (no console needed) =================
@@ -565,7 +626,7 @@
         if (!bot.on) { stopMove(); fire(false) }
         uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
       }, 'liga/desliga o cérebro (tecla B)'),
-      mkBtn('🧪 mover', '#7a5c1e', () => bot.moveTest(), 'anda pra direita 0.8s e mede'),
+      mkBtn('🎯 calib', '#7a5c1e', () => bot.calibrate(), 'acha VOCÊ por movimento (ground truth) — use se ficar parado'),
       mkBtn('📡 base', '#1e6a7a', () => { const n = findBase(); uiLog('rescan: ' + n + ' entid. @ ' + BASE + ' (' + BASE_SRC + ')', n ? '#6f6' : '#f66') }, 're-descobre a lista de entidades'),
       mkBtn('🔍 diag', '#6a1e6a', () => bot.diag(), 'lista containers + entidades no console (F12)'),
       mkBtn('👁 debug', '#3a5a2a', () => { bot.DEBUG = !bot.DEBUG; uiLog('overlay ' + (bot.DEBUG ? 'ON' : 'OFF'), '#9ad') }, 'desenha o que o bot vê sobre o jogo'),
@@ -700,5 +761,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.14] loaded — self por âncora de câmera (corrige alvo 1e14) + overlay', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.15] loaded — calibração por MOVIMENTO (acha self+container empiricamente)', 'color:#f0f;font-weight:bold')
 })()

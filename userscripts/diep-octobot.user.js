@@ -6,7 +6,7 @@
 //              level-1->45 duel: auto-spawn, auto-allocate stats to the build, auto-evolve the
 //              tank tree. Modes: 'fallen' (Booster rammer) and 'overlord' (drone turret).
 //              For private Sandbox use only. SELF-CONTAINED (captures WASM itself).
-// @version      0.12
+// @version      0.13
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -80,7 +80,7 @@
     } catch (e) {}
   })()
 
-  const VERSION = '0.12'
+  const VERSION = '0.13'
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
   // stat keys '1'..'8' = keyCodes 49..56. diep stat order:
@@ -117,6 +117,7 @@
     AIM_ZOOM: true, AIM_SCALE: 1.0,
     AUTO_STATS: true,      // continuously spend stat points in the build order as levels arrive
     AUTO_EVOLVE: true,     // auto-take tank upgrades toward the target tank (Booster/Overlord)
+    DEBUG: true,           // draw the bot's perception (self/target/entities) over the game canvas
     // upgrade-icon calibration (CSS px from top-left; ×dpr applied internally). Tune live if the
     // bot detects "UPGRADE DISPONÍVEL" but doesn't evolve.
     evoX: 40, evoY0: 120, evoDY: 78, evoClickMs: 90,
@@ -126,7 +127,7 @@
     _strafeDir: 1, _strafeT: 0, _frame: 0, _target: null, _self: null,
     _ticks: 0, _rate: 0, _warnedSlow: 0, _deadTicks: 0,
     _entCount: 0, _tankCount: 0,
-    _allocSeq: [], _allocI: 0, _evoStage: 0, _evoWasUp: false, _tdist: 0,
+    _allocSeq: [], _allocI: 0, _evoStage: 0, _evoWasUp: false, _tdist: 0, _ents: [],
   }
   W.diepBot = bot
 
@@ -367,6 +368,7 @@
 
     if ((bot._frame++ & 3) === 0) {
       const es = entities()
+      bot._ents = es
       bot._entCount = es.length
       bot._tankCount = es.filter(e => e.tank).length
       bot._self = findSelf(es)
@@ -578,6 +580,7 @@
       mkBtn('🧪 mover', '#7a5c1e', () => bot.moveTest(), 'anda pra direita 0.8s e mede'),
       mkBtn('📡 base', '#1e6a7a', () => { const n = findBase(); uiLog('rescan: ' + n + ' entid. @ ' + BASE + ' (' + BASE_SRC + ')', n ? '#6f6' : '#f66') }, 're-descobre a lista de entidades'),
       mkBtn('🔍 diag', '#6a1e6a', () => bot.diag(), 'lista containers + entidades no console (F12)'),
+      mkBtn('👁 debug', '#3a5a2a', () => { bot.DEBUG = !bot.DEBUG; uiLog('overlay ' + (bot.DEBUG ? 'ON' : 'OFF'), '#9ad') }, 'desenha o que o bot vê sobre o jogo'),
     )
     const setup = document.createElement('div')
     setup.style.cssText = 'margin-top:6px;padding:6px 7px;background:#3a0d0d;border:1px solid #b44;border-radius:6px;color:#fbb;display:none;font-size:10px;line-height:1.45'
@@ -608,9 +611,10 @@
     setRow(UI.rows.mem, r ? 'capturada ✔' : 'NÃO capturada', r ? '#6f6' : '#f66')
     if (UI.setup) UI.setup.style.display = r ? 'none' : 'block'
     if (!r) { setRow(UI.rows.st, 'aguardando heap…', '#fa0'); return }
-    // light scan while idle so the panel is truthful before the bot is on
+    // light scan while idle so the panel + overlay are truthful before the bot is on
     if (!bot.on) {
       const es = entities()
+      bot._ents = es
       bot._entCount = es.length
       bot._tankCount = es.filter(e => e.tank).length
       bot._self = findSelf(es)
@@ -629,6 +633,58 @@
   }
   setInterval(uiRefresh, 500)
 
+  // ---- visual debug overlay: draw the bot's perception ON the game (dots should sit on sprites) ----
+  let _ov = null, _ovc = null
+  function overlay() {
+    if (!document.body) return
+    if (!_ov) {
+      _ov = document.createElement('canvas'); _ov.id = '__octobot_overlay'
+      _ov.style.cssText = 'position:fixed;left:0;top:0;pointer-events:none;z-index:2147483646'
+      document.body.appendChild(_ov); _ovc = _ov.getContext('2d')
+    }
+    const g = _ovc, W2 = window.innerWidth, H2 = window.innerHeight
+    if (_ov.width !== W2) _ov.width = W2
+    if (_ov.height !== H2) _ov.height = H2
+    g.clearRect(0, 0, W2, H2)
+    if (!bot.DEBUG) return
+    if (!ready() || !bot._self) {
+      g.fillStyle = '#f66'; g.font = 'bold 14px monospace'
+      g.fillText('octobot debug: ' + (!ready() ? 'sem memória' : 'SELF não achado'), 12, H2 - 16); return
+    }
+    const self = bot._self, sx = self.ox, sy = self.oy
+    const dp = (window.devicePixelRatio || 1), z = zoom() / dp   // world units -> CSS px
+    const cx = W2 / 2, cy = H2 / 2
+    const es = bot._ents || []
+    for (const e of es) {
+      if (e === self) continue
+      const x = cx + (e.ox - sx) * z, y = cy + (e.oy - sy) * z
+      if (x < -30 || x > W2 + 30 || y < -30 || y > H2 + 30) continue
+      g.beginPath(); g.arc(x, y, e.tank ? 9 : 5, 0, 7)
+      g.fillStyle = e.tank ? 'rgba(0,210,255,.85)' : (e.owned ? 'rgba(255,150,0,.7)' : 'rgba(160,160,160,.6)')
+      g.fill()
+    }
+    // target: pink ring + line from self
+    const t = bot._target
+    if (t) {
+      const x = cx + (t.ox - sx) * z, y = cy + (t.oy - sy) * z
+      g.strokeStyle = 'rgba(255,0,255,.7)'; g.lineWidth = 2; g.beginPath(); g.moveTo(cx, cy); g.lineTo(x, y); g.stroke()
+      g.strokeStyle = '#f0f'; g.lineWidth = 3; g.beginPath(); g.arc(x, y, 17, 0, 7); g.stroke()
+    }
+    // self: green ring at screen center (camera follows self)
+    g.strokeStyle = '#0f0'; g.lineWidth = 3; g.beginPath(); g.arc(cx, cy, 15, 0, 7); g.stroke()
+    // HUD
+    g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(8, H2 - 74, 430, 64)
+    g.font = 'bold 12px monospace'; g.fillStyle = '#7f7'
+    g.fillText('VERDE=você · ROSA=alvo · azul=tanque cinza=shape laranja=bala', 14, H2 - 54)
+    g.fillStyle = '#8cf'; g.fillText('as bolinhas batem nos sprites reais? o rosa está em você-inimigo?', 14, H2 - 40)
+    g.fillStyle = '#fff'
+    g.fillText('mode ' + bot.MODE + ' · hp ' + Math.round(selfHealth() * 100) + '% · alvo ' +
+      (t ? Math.round(bot._tdist || t._d) + 'u ' + (t.tank ? 'TANQUE' : 'shape') : '—') +
+      ' · evo ' + bot._evoStage + '/3', 14, H2 - 24)
+    g.fillText('ents ' + es.length + ' · tanques ' + (bot._tankCount || 0) + ' · base ' + BASE_SRC +
+      ' · zoom ' + zoom().toFixed(2) + ' · ' + (bot.on ? 'ON' : 'OFF'), 14, H2 - 10)
+  }
+
   // ---- tick loop: Worker-driven so it keeps running when the tab is backgrounded ----
   let _lastTick = 0
   function tickGuard() { const n = performance.now(); if (n - _lastTick < 30) return; _lastTick = n; try { tick() } catch (e) {} }
@@ -638,7 +694,7 @@
     wk.onmessage = tickGuard
   } catch (e) { /* CSP — fall back to timers below */ }
   setInterval(tickGuard, 50)
-  ;(function raf() { tickGuard(); requestAnimationFrame(raf) })()
+  ;(function raf() { tickGuard(); try { overlay() } catch (e) {} requestAnimationFrame(raf) })()
   setInterval(allocTick, 110)     // continuous stat allocation (spends points in build priority)
   setInterval(evolveTick, 260)    // auto-evolve when a tank-upgrade panel is up
   setInterval(() => {
@@ -656,5 +712,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.12] loaded — coords relativas a SELF (corrige mira/movimento) + auto-evolve', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.13] loaded — overlay visual de debug (o bot desenha o que vê)', 'color:#f0f;font-weight:bold')
 })()

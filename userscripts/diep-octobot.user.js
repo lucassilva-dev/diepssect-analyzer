@@ -6,7 +6,7 @@
 //              level-1->45 duel: auto-spawn, auto-allocate stats to the build, auto-evolve the
 //              tank tree. Modes: 'fallen' (Booster rammer) and 'overlord' (drone turret).
 //              For private Sandbox use only. SELF-CONTAINED (captures WASM itself).
-// @version      0.13
+// @version      0.14
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -80,7 +80,7 @@
     } catch (e) {}
   })()
 
-  const VERSION = '0.13'
+  const VERSION = '0.14'
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
   // stat keys '1'..'8' = keyCodes 49..56. diep stat order:
@@ -183,35 +183,32 @@
   const WORLD = 582904, STATIC_BASE = WORLD + 1120, REG = 467744
   let BASE = 0, BASE_SRC = 'none', _dryScans = 0
   const liveNode = nd => ok(nd) && u16(nd + 116) !== 6875
-  // Scan a candidate container: count live nodes AND detect a "self" node — a valid-health entity
-  // sitting at camera-relative origin. ONLY the currently-active arena container has the local tank
-  // at ~(0,0); stale/old containers linger in memory full of garbage but have no near-origin tank.
-  // Picking by node count alone chose a wrong container (47 fake "tanks", phantom target @2490u).
-  // Scan a candidate container and try to locate SELF by the camera-followed id. The container's
-  // camera object is the 1st element of the vector @b+676; its id-tuple is (u16 cam+68 gen,
-  // u16 cam+72 idx). SELF = the live node whose id (node+116/+120) matches AND is alive (hp>0).
-  // This is garbage-proof: earlier we matched "a valid-health node near origin", but entities are
-  // NOT camera-relative here (self is not at 0,0) and dead junk decodes to (0,0) with hp 0, which
-  // fooled it. The camera-id match is exact.
+  // Locate SELF robustly by the CAMERA ANCHOR. The local camera world pos is f32@591660/591664
+  // (validated to track the player). SELF = the alive, named, unowned tank whose decoded position
+  // best matches that anchor in EITHER frame (world: pos≈anchor, or camera-relative: pos≈0).
+  // Garbage/dead nodes decode to huge values and are rejected by the error bound. This replaced a
+  // camera-id match that failed live (base read 'registry?' with a garbage self -> target ~1e14u).
   function scanBase(b) {
-    if (!ok(b + 7196)) return { n: 0, selfNode: 0 }
-    let cg = -1, ci = -1
-    const beg = u32(b + 676)
-    if (ok(beg) && beg !== u32(b + 680)) { const cam = u32(beg); if (ok(cam)) { cg = u16(cam + 68); ci = u16(cam + 72) } }
-    let n = 0, selfNode = 0
+    if (!ok(b + 7196)) return { n: 0, selfNode: 0, err: Infinity }
+    const cxw = camX(), cyw = camY()
+    let n = 0, selfNode = 0, bestErr = Infinity
     try {
       for (let pr = 0; pr < 16384; pr++) {
         if (!((u8(b + 796 + (pr >> 3)) >> (pr & 7)) & 1)) continue
         const pg = u32(b + 6940 + ((pr >> 8) << 2)); if (!ok(pg)) continue
         const nd = (pg + (pr & 255) * 224) >>> 0; if (!liveNode(nd)) continue
         n++
-        if (!selfNode && cg >= 0 && cg !== 6875 && u16(nd + 116) === cg && u16(nd + 120) === ci) {
-          const H = u32(nd + 176), R = u32(nd + 172)
-          if (ok(R) && ok(H)) { const r = f32(H + 48); if (r > 0.01 && r <= 1.02) selfNode = nd }
-        }
+        const R = u32(nd + 172), H = u32(nd + 176); if (!ok(R) || !ok(H)) continue
+        const hp = f32(H + 48); if (!(hp > 0.01 && hp <= 1.02)) continue
+        if (!ok(u32(nd + 168)) || isOwned(nd)) continue              // alive named unowned = a tank
+        const ox = decode(u32(R + 144)), oy = decode(u32(R + 164))
+        if (!Number.isFinite(ox) || !Number.isFinite(oy)) continue
+        const err = Math.min(Math.hypot(ox - cxw, oy - cyw), Math.hypot(ox, oy))
+        if (err < bestErr) { bestErr = err; selfNode = nd }
       }
     } catch (e) {}
-    return { n, selfNode }
+    if (bestErr > 4000) selfNode = 0                                 // no plausible self here
+    return { n, selfNode, err: bestErr }
   }
   function regCandidates() {
     const seen = new Set([STATIC_BASE]), cands = []
@@ -223,15 +220,14 @@
     return cands
   }
   function findBase() {
-    // 1) static container whose camera-id resolves to a live self -> authoritative
+    // pick the container whose best self-candidate matches the camera anchor most closely
     const st = scanBase(STATIC_BASE)
-    if (st.selfNode) { BASE = STATIC_BASE; BASE_SRC = 'static+self'; return st.n }
-    // 2) registry container whose camera-id resolves to a live self -> richest such
+    let best = st.selfNode ? STATIC_BASE : 0, bestErr = st.selfNode ? st.err : Infinity, bestN = st.n
+    let src = st.selfNode ? 'static+self' : ''
     const cands = regCandidates()
-    let best = 0, bestN = 0
-    for (const b of cands) { const r = scanBase(b); if (r.selfNode && r.n > bestN) { bestN = r.n; best = b } }
-    if (best) { BASE = best; BASE_SRC = 'registry+self'; return bestN }
-    // 3) no self match anywhere (dead/loading) -> fall back to the richest container
+    for (const b of cands) { const r = scanBase(b); if (r.selfNode && r.err < bestErr) { bestErr = r.err; best = b; bestN = r.n; src = 'registry+self' } }
+    if (best) { BASE = best; BASE_SRC = src; return bestN }
+    // no plausible self anywhere (dead/loading) -> fall back to the richest container
     let fb = STATIC_BASE, fbn = st.n
     for (const b of cands) { const r = scanBase(b); if (r.n > fbn) { fbn = r.n; fb = b } }
     BASE = fb; BASE_SRC = (fb === STATIC_BASE ? 'static?' : 'registry?')
@@ -272,25 +268,19 @@
     if (!out.length) { if (++_dryScans >= 15) { _dryScans = 0; findBase() } } else _dryScans = 0
     return out
   }
-  // self = the node the local camera follows (raw u16 id match on the camera object from the
-  // vector @BASE+676; verified func-77 path). u16(cam+68)==6875 => the local tank is DEAD.
-  function cameraObj() {
-    const beg = u32(BASE + 676), end = u32(BASE + 680)
-    if (!ok(beg) || beg === end) return 0
-    const cam = u32(beg)
-    return ok(cam) ? cam : 0
-  }
-  function selfDead() { if (!BASE) return false; const c = cameraObj(); return c ? u16(c + 68) === 6875 : false }
+  // dead/loading when we can't resolve a self node (drives the auto-respawn)
+  function selfDead() { return !bot._self }
+  // SELF = the alive, named, unowned tank whose decoded pos best matches the camera anchor
+  // (world 591660/591664 OR camera-relative origin). Garbage/dead nodes are far from both -> rejected.
   function findSelf(es) {
-    const c = cameraObj()
-    if (c) {
-      const g = u16(c + 68), k = u16(c + 72)
-      if (g !== 6875) for (const e of es) if (u16(e.node + 116) === g && u16(e.node + 120) === k) return e
+    const cxw = camX(), cyw = camY()
+    let self = null, bestErr = Infinity
+    for (const e of es) {
+      if (!e.tank) continue
+      const err = Math.min(Math.hypot(e.ox - cxw, e.oy - cyw), Math.hypot(e.ox, e.oy))
+      if (err < bestErr) { bestErr = err; self = e }
     }
-    // fallback: the highest-health real tank (self is alive; avoids the hp-0 garbage at origin)
-    let best = null
-    for (const e of es) if (e.tank && (!best || e.hp > best.hp)) best = e
-    return best
+    return bestErr < 4000 ? self : null
   }
 
   function selfHealth() {
@@ -354,15 +344,6 @@
     if (!bot.on || !ready()) return
     gates()
 
-    // dead? stop everything and try to respawn every ~2s (camera gen == 6875 => no tank)
-    if (selfDead()) {
-      stopMove(); fire(false)
-      bot._deadTicks++
-      if (bot._deadTicks % 60 === 1) { uiLog('morri — respawnando…', '#fa0'); bot.spawn() }
-      return
-    }
-    bot._deadTicks = 0
-
     // upgrade panel up? pause combat so auto-evolve (separate loop) can click the icon cleanly
     if (upgradeUp()) { stopMove(); return }
 
@@ -375,7 +356,14 @@
       bot._target = pickTarget(es, bot._self)
     } else { refresh(bot._self); refresh(bot._target) }
     const self = bot._self, t = bot._target
-    if (!self || !t) { stopMove(); fire(false); return }
+    // no self resolved => dead or loading: stop + respawn periodically
+    if (!self) {
+      stopMove(); fire(false); bot._deadTicks++
+      if (bot._deadTicks % 120 === 1) { uiLog('sem self (morto/carregando) — respawn', '#fa0'); bot.spawn() }
+      return
+    }
+    bot._deadTicks = 0
+    if (!t) { stopMove(); fire(false); return }
 
     let cw = i32(602700), ch = i32(602704)             // canvas device px (verified globals)
     if (!(cw > 0 && ch > 0)) { const cv = document.querySelector('canvas'); cw = cv ? cv.width : window.innerWidth; ch = cv ? cv.height : window.innerHeight }
@@ -712,5 +700,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.13] loaded — overlay visual de debug (o bot desenha o que vê)', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.14] loaded — self por âncora de câmera (corrige alvo 1e14) + overlay', 'color:#f0f;font-weight:bold')
 })()

@@ -88,33 +88,41 @@
   // entity's screen pixel. We hook the 2D context, collect draw points per frame, and cluster nearby
   // points into entities. This needs ZERO memory offsets — immune to game-version changes (the whole
   // reason the memory approach kept failing: the local diep.wat is an older build).
-  const DRAW = { frame: [], acc: [], w: 0, h: 0, fps: 0, _fc: 0, _t: 0 }
+  const DRAW = { frame: [], acc: [], w: 0, h: 0, fps: 0, _fc: 0, _t: 0, canvas: null }
   ;(function hookCanvas2D() {
     try {
       const C = W.CanvasRenderingContext2D && W.CanvasRenderingContext2D.prototype
       if (!C || C.__octoHooked) return
       C.__octoHooked = true
-      // cache the main (largest) canvas — querySelectorAll on every fill would tank performance
+      // cache the main (largest) canvas, EXCLUDING our own overlay — querySelectorAll on every fill
+      // would tank performance, and picking the overlay would record our own dots (feedback loop).
       let _mc = null, _mcT = 0
-      const mainCanvas = () => { const now = performance.now(); if (!_mc || now - _mcT > 600) { let best = null; for (const c of document.querySelectorAll('canvas')) if (c.width > 200 && (!best || c.width * c.height > best.width * best.height)) best = c; _mc = best; _mcT = now } return _mc }
-      const isMain = ctx => ctx.canvas === mainCanvas()
-      // record a draw point (entity centre = current transform translation). Only fills — the grid
-      // and outlines use stroke() (skipped) so they don't pollute the entity clusters.
-      const rec = ctx => { try { const t = ctx.getTransform(); const e = t.e, f = t.f; if (Number.isFinite(e) && Number.isFinite(f)) DRAW.acc.push(e, f) } catch (x) {} }
-      const boundary = ctx => {
-        try {
-          DRAW.frame = DRAW.acc; DRAW.acc = []
-          DRAW.w = ctx.canvas.width; DRAW.h = ctx.canvas.height
-          DRAW._fc++; const now = performance.now(); if (now - DRAW._t > 1000) { DRAW.fps = DRAW._fc; DRAW._fc = 0; DRAW._t = now }
-        } catch (x) {}
+      const mainCanvas = () => {
+        const now = performance.now()
+        if (!_mc || now - _mcT > 600) {
+          let best = null
+          for (const c of document.querySelectorAll('canvas')) {
+            if (c.id === '__octobot_overlay') continue
+            if (c.width > 200 && (!best || c.width * c.height > best.width * best.height)) best = c
+          }
+          _mc = best; _mcT = now; DRAW.canvas = best; if (best) { DRAW.w = best.width; DRAW.h = best.height }
+        }
+        return _mc
       }
-      const oFill = C.fill; if (oFill) C.fill = function () { if (isMain(this)) rec(this); return oFill.apply(this, arguments) }
-      // a full-canvas fillRect (background) or clearRect marks the start of a new frame
-      const oFR = C.fillRect; if (oFR) C.fillRect = function (x, y, w, h) { if (isMain(this)) { if (w >= this.canvas.width * 0.8 && h >= this.canvas.height * 0.8) boundary(this); else rec(this) } return oFR.apply(this, arguments) }
-      const oClear = C.clearRect; if (oClear) C.clearRect = function (x, y, w, h) { if (isMain(this) && w >= this.canvas.width * 0.8) boundary(this); return oClear.apply(this, arguments) }
+      // record a draw point (entity centre = current transform translation). Only fills — the grid
+      // and outlines use stroke() (not hooked) so they don't pollute the entity clusters. acc is
+      // sliced into a frame each requestAnimationFrame (bounded; no unbounded growth).
+      const rec = ctx => { try { if (DRAW.acc.length > 60000) return; const t = ctx.getTransform(); if (Number.isFinite(t.e) && Number.isFinite(t.f)) DRAW.acc.push(t.e, t.f) } catch (x) {} }
+      const oFill = C.fill; if (oFill) C.fill = function () { if (this.canvas === mainCanvas()) rec(this); return oFill.apply(this, arguments) }
+      const oFR = C.fillRect; if (oFR) C.fillRect = function (x, y, w, h) { if (this.canvas === mainCanvas() && !(w >= this.canvas.width * 0.8 && h >= this.canvas.height * 0.8)) rec(this); return oFR.apply(this, arguments) }
       console.log('%c[octobot] canvas 2D hooked — percepção pelo renderizador', 'color:#0f0')
     } catch (e) { console.warn('[octobot] canvas hook falhou', e) }
   })()
+  // slice the accumulated draws into "this frame" and reset — called once per rAF (below)
+  function drawFlip() {
+    DRAW.frame = DRAW.acc; DRAW.acc = []
+    DRAW._fc++; const now = performance.now(); if (now - DRAW._t > 1000) { DRAW.fps = DRAW._fc; DRAW._fc = 0; DRAW._t = now }
+  }
   // cluster this-frame draw points into entities (screen device px). n = # draws (size/complexity hint)
   function screenEnts() {
     const p = DRAW.frame, R = 22, R2 = R * R, cl = []
@@ -781,7 +789,9 @@
     wk.onmessage = tickGuard
   } catch (e) { /* CSP — fall back to timers below */ }
   setInterval(tickGuard, 50)
-  ;(function raf() { tickGuard(); try { overlay() } catch (e) {} requestAnimationFrame(raf) })()
+  // rAF (registered after the game's) runs after the game drew this frame: slice draws -> frame,
+  // then tick (perceives from DRAW.frame) + overlay. Perception updates only while the tab renders.
+  ;(function raf() { try { drawFlip() } catch (e) {} tickGuard(); try { overlay() } catch (e) {} requestAnimationFrame(raf) })()
   setInterval(allocTick, 110)     // continuous stat allocation (spends points in build priority)
   setInterval(evolveTick, 260)    // auto-evolve when a tank-upgrade panel is up
   setInterval(() => {

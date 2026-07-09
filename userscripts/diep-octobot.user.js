@@ -6,7 +6,7 @@
 //              level-1->45 duel: auto-spawn, auto-allocate stats to the build, auto-evolve the
 //              tank tree. Modes: 'fallen' (Booster rammer) and 'overlord' (drone turret).
 //              For private Sandbox use only. SELF-CONTAINED (captures WASM itself).
-// @version      0.15
+// @version      0.16
 // @namespace    *://diep.io/
 // @match        *://diep.io/*
 // @run-at       document-start
@@ -80,7 +80,54 @@
     } catch (e) {}
   })()
 
-  const VERSION = '0.15'
+  const VERSION = '0.16'
+
+  // ================= CANVAS-2D PERCEPTION (build-independent) =================
+  // diep renders in JS via getContext('2d') (no WebGL, no WASM canvas ops). Every entity is drawn
+  // translated to its screen center, so the current transform's translation at draw time == the
+  // entity's screen pixel. We hook the 2D context, collect draw points per frame, and cluster nearby
+  // points into entities. This needs ZERO memory offsets — immune to game-version changes (the whole
+  // reason the memory approach kept failing: the local diep.wat is an older build).
+  const DRAW = { frame: [], acc: [], w: 0, h: 0, fps: 0, _fc: 0, _t: 0 }
+  ;(function hookCanvas2D() {
+    try {
+      const C = W.CanvasRenderingContext2D && W.CanvasRenderingContext2D.prototype
+      if (!C || C.__octoHooked) return
+      C.__octoHooked = true
+      // cache the main (largest) canvas — querySelectorAll on every fill would tank performance
+      let _mc = null, _mcT = 0
+      const mainCanvas = () => { const now = performance.now(); if (!_mc || now - _mcT > 600) { let best = null; for (const c of document.querySelectorAll('canvas')) if (c.width > 200 && (!best || c.width * c.height > best.width * best.height)) best = c; _mc = best; _mcT = now } return _mc }
+      const isMain = ctx => ctx.canvas === mainCanvas()
+      // record a draw point (entity centre = current transform translation). Only fills — the grid
+      // and outlines use stroke() (skipped) so they don't pollute the entity clusters.
+      const rec = ctx => { try { const t = ctx.getTransform(); const e = t.e, f = t.f; if (Number.isFinite(e) && Number.isFinite(f)) DRAW.acc.push(e, f) } catch (x) {} }
+      const boundary = ctx => {
+        try {
+          DRAW.frame = DRAW.acc; DRAW.acc = []
+          DRAW.w = ctx.canvas.width; DRAW.h = ctx.canvas.height
+          DRAW._fc++; const now = performance.now(); if (now - DRAW._t > 1000) { DRAW.fps = DRAW._fc; DRAW._fc = 0; DRAW._t = now }
+        } catch (x) {}
+      }
+      const oFill = C.fill; if (oFill) C.fill = function () { if (isMain(this)) rec(this); return oFill.apply(this, arguments) }
+      // a full-canvas fillRect (background) or clearRect marks the start of a new frame
+      const oFR = C.fillRect; if (oFR) C.fillRect = function (x, y, w, h) { if (isMain(this)) { if (w >= this.canvas.width * 0.8 && h >= this.canvas.height * 0.8) boundary(this); else rec(this) } return oFR.apply(this, arguments) }
+      const oClear = C.clearRect; if (oClear) C.clearRect = function (x, y, w, h) { if (isMain(this) && w >= this.canvas.width * 0.8) boundary(this); return oClear.apply(this, arguments) }
+      console.log('%c[octobot] canvas 2D hooked — percepção pelo renderizador', 'color:#0f0')
+    } catch (e) { console.warn('[octobot] canvas hook falhou', e) }
+  })()
+  // cluster this-frame draw points into entities (screen device px). n = # draws (size/complexity hint)
+  function screenEnts() {
+    const p = DRAW.frame, R = 22, R2 = R * R, cl = []
+    for (let i = 0; i + 1 < p.length; i += 2) {
+      const x = p[i], y = p[i + 1]
+      let m = null
+      for (let k = 0; k < cl.length; k++) { const dx = cl[k].x - x, dy = cl[k].y - y; if (dx * dx + dy * dy < R2) { m = cl[k]; break } }
+      if (m) { m.x = (m.x * m.n + x) / (m.n + 1); m.y = (m.y * m.n + y) / (m.n + 1); m.n++ }
+      else cl.push({ x, y, n: 1 })
+    }
+    return cl
+  }
+
   // WASD keycodes (func 1298: 87->up/2, 65->left/4, 83->down/8, 68->right/16)
   const KEY = { up: 87, left: 65, down: 83, right: 68 }
   // stat keys '1'..'8' = keyCodes 49..56. diep stat order:
@@ -127,7 +174,7 @@
     _strafeDir: 1, _strafeT: 0, _frame: 0, _target: null, _self: null,
     _ticks: 0, _rate: 0, _warnedSlow: 0, _deadTicks: 0,
     _entCount: 0, _tankCount: 0,
-    _allocSeq: [], _allocI: 0, _evoStage: 0, _evoWasUp: false, _tdist: 0, _ents: [],
+    _allocSeq: [], _allocI: 0, _evoStage: 0, _evoWasUp: false, _tdist: 0, _ents: [], _inGame: false,
   }
   W.diepBot = bot
 
@@ -323,8 +370,8 @@
     if (!out.length) { if (++_dryScans >= 15) { _dryScans = 0; findBase() } } else _dryScans = 0
     return out
   }
-  // dead/loading when we can't resolve a self node (drives the auto-respawn)
-  function selfDead() { return !bot._self }
+  // "in game" = the renderer is drawing entities; drives alloc/evolve guards
+  function selfDead() { return !bot._inGame }
   // SELF = the motion-calibrated node (ground truth). If it's gone (died/reused), drop it and try
   // the camera-anchor heuristic as a fallback (works only if the coord frame matches).
   function findSelf(es) {
@@ -397,68 +444,64 @@
     if (Number.isFinite(rx) && Number.isFinite(ry)) { t.ox = rx; t.oy = ry }
   }
 
-  // ---- one tick ----
+  // ---- filter render clusters down to real targets (screen device px) ----
+  // Excludes: self (centre, camera follows the player), the minimap (bottom-right), the score/level
+  // bars (bottom), and the extreme edges. n = number of draws in the cluster (tanks draw body+barrels
+  // +outline => higher n than shapes/bullets).
+  function candidates(ents, cw, ch, cx, cy) {
+    const selfR = Math.min(cw, ch) * 0.055, m = 6
+    return ents.filter(e => {
+      const d = Math.hypot(e.x - cx, e.y - cy)
+      if (d < selfR) return false
+      if (e.x < m || e.y < m || e.x > cw - m || e.y > ch - m) return false
+      if (e.x > cw * 0.78 && e.y > ch * 0.70) return false     // minimap
+      if (e.y > ch * 0.86) return false                        // score/level bars
+      return true
+    })
+  }
+
+  // ---- one tick: perceive via canvas, drive via WASM inputs ----
   function tick() {
     bot._ticks++
     if (!bot.on || !ready()) return
     gates()
+    if (upgradeUp()) { stopMove(); return }   // let auto-evolve click the panel
 
-    // upgrade panel up? pause combat so auto-evolve (separate loop) can click the icon cleanly
-    if (upgradeUp()) { stopMove(); return }
+    let cw = DRAW.w || i32(602700), ch = DRAW.h || i32(602704)
+    if (!(cw > 0 && ch > 0)) { const cv = document.querySelector('canvas'); cw = cv ? cv.width : window.innerWidth; ch = cv ? cv.height : window.innerHeight }
+    const cx = cw / 2, cy = ch / 2
 
-    if ((bot._frame++ & 3) === 0) {
-      const es = entities()
-      bot._ents = es
-      bot._entCount = es.length
-      bot._tankCount = es.filter(e => e.tank).length
-      bot._self = findSelf(es)
-      bot._target = pickTarget(es, bot._self)
-    } else { refresh(bot._self); refresh(bot._target) }
-    const self = bot._self, t = bot._target
-    // no self resolved => dead or loading: stop, respawn + recalibrate periodically
-    if (!self) {
-      stopMove(); fire(false); bot._deadTicks++
-      if (bot._deadTicks % 150 === 1) { uiLog('sem self — respawn + recalibrar', '#fa0'); bot.spawn(); setTimeout(() => calibrate(), 1400) }
+    const ents = screenEnts()
+    bot._ents = ents; bot._entCount = ents.length
+    const cand = candidates(ents, cw, ch, cx, cy)
+    bot._tankCount = cand.filter(e => e.n >= 4).length
+    bot._inGame = ents.length > 2
+
+    if (!cand.length) {
+      stopMove(); fire(false); bot._target = null; bot._deadTicks++
+      if (bot._deadTicks % 150 === 1 && ents.length < 3) bot.spawn()   // likely dead/menu -> Play
       return
     }
     bot._deadTicks = 0
-    if (!t) { stopMove(); fire(false); return }
 
-    let cw = i32(602700), ch = i32(602704)             // canvas device px (verified globals)
-    if (!(cw > 0 && ch > 0)) { const cv = document.querySelector('canvas'); cw = cv ? cv.width : window.innerWidth; ch = cv ? cv.height : window.innerHeight }
-    const z = zoom() * bot.AIM_SCALE
-    // target offset FROM SELF (world units) — camera follows self, so screen px = center + off*zoom
-    const rx = t.ox - self.ox, ry = t.oy - self.oy
-    const dist = Math.hypot(rx, ry) || 1, ux = rx / dist, uy = ry / dist
-    bot._tdist = dist
-    const fleeing = selfHealth() < bot.retreatHP
+    // target: prefer complex clusters (tanks) near centre; else nearest anything (farm shapes)
+    cand.forEach(e => { e._d = Math.hypot(e.x - cx, e.y - cy) })
+    const tanks = cand.filter(e => e.n >= 4 && e._d < 700)
+    const pool = (bot.PREFER_PLAYERS && tanks.length) ? tanks : cand
+    pool.sort((a, b) => a._d - b._d)
+    const t = pool[0]; bot._target = t; bot._tdist = t._d
+    const rx = t.x - cx, ry = t.y - cy, d = Math.hypot(rx, ry) || 1, ux = rx / d, uy = ry / d
 
-    if (bot.MODE === 'fallen') {
-      // Fallen Booster: ram the target. Firing = rear-barrel recoil thrust toward the mouse.
-      if (fleeing) {
-        aimPx(cw / 2 - rx * z, ch / 2 - ry * z)       // aim AWAY -> thrust boosts the escape
-        fire(true)
-        moveVec(-ux, -uy)
-      } else {
-        aimPx(cw / 2 + rx * z, ch / 2 + ry * z)       // aim AT the target = thrust INTO the ram
-        fire(bot.FIRE)
-        moveVec(ux, uy)
-      }
-      return
-    }
+    aimPx(t.x, t.y)   // t is already screen device px == va()'s coordinate space
 
-    // overlord / turret: aim + fire, orbit at range
-    aimPx(cw / 2 + rx * z, ch / 2 + ry * z)
-    fire(bot.FIRE && dist < bot.farmFire)
+    if (bot.MODE === 'fallen') { fire(bot.FIRE); moveVec(ux, uy); return }   // ram: aim + thrust + drive in
+
+    // overlord/turret: fire + orbit at range
+    fire(bot.FIRE)
     let mx = 0, my = 0
-    if (fleeing) { mx = -ux; my = -uy }
-    else {
-      if (dist > bot.keepDist) { mx += ux; my += uy }
-      else if (dist < bot.tooClose) { mx -= ux; my -= uy }
-      if (++bot._strafeT > bot.strafeFlip) { bot._strafeT = 0; bot._strafeDir *= -1 }
-      mx += -uy * bot.strafeGain * bot._strafeDir
-      my += ux * bot.strafeGain * bot._strafeDir
-    }
+    if (d > 300) { mx += ux; my += uy } else if (d < 170) { mx -= ux; my -= uy }
+    if (++bot._strafeT > bot.strafeFlip) { bot._strafeT = 0; bot._strafeDir *= -1 }
+    mx += -uy * bot.strafeGain * bot._strafeDir; my += ux * bot.strafeGain * bot._strafeDir
     moveVec(mx, my)
   }
 
@@ -541,13 +584,12 @@
     if (mode) bot.MODE = mode
     if (!ready()) { uiLog('mem não capturada — recarregue (F5) e tente de novo', '#f66'); return }
     uiLog('start ' + bot.MODE + ': Play (nível 1)…')
-    bot._evoStage = 0; bot._evoWasUp = false; SELF_NODE = 0    // fresh path
+    bot._evoStage = 0; bot._evoWasUp = false
     bot.spawn(); await sleep(1400)
-    setBuild()                                  // start continuous stat allocation for this build
-    const okc = await calibrate()               // motion-lock self + container (ground truth)
-    uiLog('jogando 1→45: upa stats + evolui. Árvore: ' + TREE[bot.MODE], '#0ff')
+    setBuild()                                  // continuous stat allocation for this build
+    uiLog('jogando 1→45 (percepção canvas): upa stats + evolui. Árvore: ' + TREE[bot.MODE], '#0ff')
     bot.on = true
-    uiLog('BOT ON — jogando (' + bot.MODE + ')' + (okc ? '' : ' — se parado, clique 🎯 calib'), '#f0f')
+    uiLog('BOT ON — jogando (' + bot.MODE + ')', '#f0f')
   }
 
   // ================= UI PANEL (no console needed) =================
@@ -660,21 +702,21 @@
     setRow(UI.rows.mem, r ? 'capturada ✔' : 'NÃO capturada', r ? '#6f6' : '#f66')
     if (UI.setup) UI.setup.style.display = r ? 'none' : 'block'
     if (!r) { setRow(UI.rows.st, 'aguardando heap…', '#fa0'); return }
-    // light scan while idle so the panel + overlay are truthful before the bot is on
+    // idle: perceive from the render stream so the panel + overlay are truthful before ON
+    let cw = DRAW.w || 1, ch = DRAW.h || 1
     if (!bot.on) {
-      const es = entities()
-      bot._ents = es
-      bot._entCount = es.length
-      bot._tankCount = es.filter(e => e.tank).length
-      bot._self = findSelf(es)
-      bot._target = pickTarget(es, bot._self)
+      const es = screenEnts(); bot._ents = es; bot._entCount = es.length
+      const cand = candidates(es, cw, ch, cw / 2, ch / 2)
+      bot._tankCount = cand.filter(e => e.n >= 4).length
+      bot._inGame = es.length > 2
+      cand.forEach(e => { e._d = Math.hypot(e.x - cw / 2, e.y - ch / 2) })
+      cand.sort((a, b) => a._d - b._d); bot._target = cand[0] || null
     }
-    setRow(UI.rows.base, BASE ? BASE + ' (' + BASE_SRC + ')' : 'não achada', BASE ? '#6f6' : '#f66')
-    setRow(UI.rows.ents, bot._entCount + ' · ' + (bot._tankCount || 0) + ' tanque(s)', bot._entCount ? '#6f6' : '#f66')
-    const dead = selfDead()
-    setRow(UI.rows.self, dead ? 'MORTO' : (bot._self ? 'vivo · HP ' + Math.round(selfHealth() * 100) + '%' : '—'), dead ? '#f66' : '#6f6')
+    setRow(UI.rows.base, 'render ' + DRAW.w + '×' + DRAW.h + ' @' + DRAW.fps + 'fps', DRAW.w ? '#6f6' : '#f66')
+    setRow(UI.rows.ents, bot._entCount + ' · ' + (bot._tankCount || 0) + ' tanque(s)', bot._entCount ? '#6f6' : '#fa0')
+    setRow(UI.rows.self, bot._inGame ? 'no jogo (centro)' : 'fora/menu', bot._inGame ? '#6f6' : '#fa0')
     const t = bot._target
-    setRow(UI.rows.tgt, t ? Math.round(bot.on ? (bot._tdist || t._d) : t._d) + 'u ' + (t.tank ? '(tanque!)' : '(shape)') : 'nenhum', t ? (t.tank ? '#f6f' : '#fd6') : '#888')
+    setRow(UI.rows.tgt, t ? Math.round(t._d) + 'px ' + (t.n >= 4 ? '(tanque)' : '(shape)') : 'nenhum', t ? (t.n >= 4 ? '#f6f' : '#fd6') : '#888')
     const up = upgradeUp()
     setRow(UI.rows.evo, up ? '⚡ UPGRADE DISPONÍVEL' : 'etapa ' + bot._evoStage + '/3', up ? '#ff5' : '#8fb')
     setRow(UI.rows.loop, bot._rate + ' t/s', bot._rate >= 15 ? '#6f6' : '#fa0')
@@ -696,42 +738,38 @@
     if (_ov.height !== H2) _ov.height = H2
     g.clearRect(0, 0, W2, H2)
     if (!bot.DEBUG) return
-    if (!ready() || !bot._self) {
-      g.fillStyle = '#f66'; g.font = 'bold 14px monospace'
-      g.fillText('octobot debug: ' + (!ready() ? 'sem memória' : 'SELF não achado'), 12, H2 - 16); return
-    }
-    const self = bot._self, sx = self.ox, sy = self.oy
-    const dp = (window.devicePixelRatio || 1), z = zoom() / dp   // world units -> CSS px
+    const dp = (window.devicePixelRatio || 1)   // device px (canvas) -> CSS px (overlay)
     const cx = W2 / 2, cy = H2 / 2
-    const es = bot._ents || []
+    if (!ready() || !DRAW.w) {
+      g.fillStyle = '#f66'; g.font = 'bold 14px monospace'
+      g.fillText('octobot: ' + (!ready() ? 'sem memória' : 'sem draws do canvas ainda'), 12, H2 - 16); return
+    }
+    const es = bot._ents || [], selfR = Math.min(DRAW.w, DRAW.h) * 0.055
     for (const e of es) {
-      if (e === self) continue
-      const x = cx + (e.ox - sx) * z, y = cy + (e.oy - sy) * z
-      if (x < -30 || x > W2 + 30 || y < -30 || y > H2 + 30) continue
-      g.beginPath(); g.arc(x, y, e.tank ? 9 : 5, 0, 7)
-      g.fillStyle = e.tank ? 'rgba(0,210,255,.85)' : (e.owned ? 'rgba(255,150,0,.7)' : 'rgba(160,160,160,.6)')
+      const x = e.x / dp, y = e.y / dp
+      const dc = Math.hypot(e.x - DRAW.w / 2, e.y - DRAW.h / 2)
+      if (dc < selfR) continue                    // that's self (centre); drawn below
+      g.beginPath(); g.arc(x, y, e.n >= 4 ? 9 : 5, 0, 7)
+      g.fillStyle = e.n >= 4 ? 'rgba(0,210,255,.85)' : 'rgba(170,170,170,.6)'
       g.fill()
     }
-    // target: pink ring + line from self
     const t = bot._target
     if (t) {
-      const x = cx + (t.ox - sx) * z, y = cy + (t.oy - sy) * z
+      const x = t.x / dp, y = t.y / dp
       g.strokeStyle = 'rgba(255,0,255,.7)'; g.lineWidth = 2; g.beginPath(); g.moveTo(cx, cy); g.lineTo(x, y); g.stroke()
       g.strokeStyle = '#f0f'; g.lineWidth = 3; g.beginPath(); g.arc(x, y, 17, 0, 7); g.stroke()
     }
-    // self: green ring at screen center (camera follows self)
-    g.strokeStyle = '#0f0'; g.lineWidth = 3; g.beginPath(); g.arc(cx, cy, 15, 0, 7); g.stroke()
+    g.strokeStyle = '#0f0'; g.lineWidth = 3; g.beginPath(); g.arc(cx, cy, 15, 0, 7); g.stroke()   // self = centre
     // HUD
-    g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(8, H2 - 74, 430, 64)
+    g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(8, H2 - 74, 470, 64)
     g.font = 'bold 12px monospace'; g.fillStyle = '#7f7'
-    g.fillText('VERDE=você · ROSA=alvo · azul=tanque cinza=shape laranja=bala', 14, H2 - 54)
-    g.fillStyle = '#8cf'; g.fillText('as bolinhas batem nos sprites reais? o rosa está em você-inimigo?', 14, H2 - 40)
+    g.fillText('percepção CANVAS (sem offsets de memória) · VERDE=você ROSA=alvo', 14, H2 - 54)
+    g.fillStyle = '#8cf'; g.fillText('as bolinhas caem nos sprites reais? azul=tanque cinza=shape', 14, H2 - 40)
     g.fillStyle = '#fff'
-    g.fillText('mode ' + bot.MODE + ' · hp ' + Math.round(selfHealth() * 100) + '% · alvo ' +
-      (t ? Math.round(bot._tdist || t._d) + 'u ' + (t.tank ? 'TANQUE' : 'shape') : '—') +
-      ' · evo ' + bot._evoStage + '/3', 14, H2 - 24)
-    g.fillText('ents ' + es.length + ' · tanques ' + (bot._tankCount || 0) + ' · base ' + BASE_SRC +
-      ' · zoom ' + zoom().toFixed(2) + ' · ' + (bot.on ? 'ON' : 'OFF'), 14, H2 - 10)
+    g.fillText('mode ' + bot.MODE + ' · alvo ' + (t ? Math.round(t._d) + 'px ' + (t.n >= 4 ? 'TANQUE' : 'shape') : '—') +
+      ' · evo ' + bot._evoStage + '/3 · ' + (bot.on ? 'ON' : 'OFF'), 14, H2 - 24)
+    g.fillText('draws/frame ' + (((DRAW.frame || []).length / 2) | 0) + ' · clusters ' + es.length +
+      ' · fps ' + DRAW.fps + ' · canvas ' + DRAW.w + '×' + DRAW.h, 14, H2 - 10)
   }
 
   // ---- tick loop: Worker-driven so it keeps running when the tab is backgrounded ----
@@ -761,5 +799,5 @@
       uiLog(bot.on ? 'BOT ON — caçando (' + bot.MODE + ')' : 'BOT OFF', bot.on ? '#f0f' : '#ccc')
     }
   })
-  console.log('%c[octobot v0.15] loaded — calibração por MOVIMENTO (acha self+container empiricamente)', 'color:#f0f;font-weight:bold')
+  console.log('%c[octobot v0.16] loaded — percepção via CANVAS (renderizador), sem offsets de memória', 'color:#f0f;font-weight:bold')
 })()
